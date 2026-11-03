@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 from playwright.sync_api import Page, TimeoutError as PWTimeoutError
 
 from ..config import KTXAConfig
-from . import CaptchaDetected, SiteLayoutChanged
+from . import CaptchaDetected, GuardBlocked, SiteLayoutChanged
 from . import selectors as S
 from .client import (
     KorailSPAClient,
@@ -41,6 +41,15 @@ from .client import (
 LOGGER = logging.getLogger("ktx_watcher_spa.korail.search")
 
 _TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
+
+# ── 응답끼리 비교하기 위한 기준선 ────────────────────────────────────────
+# 워처는 어차피 같은 질의를 반복한다. 따로 저장소를 두지 않고, **이번 실행에서
+# 받은 응답들** 중 최대 row 수를 들고 있다가 갑자기 쪼그라들면 의심한다.
+# (2026-11-03: 코레일은 '목록을 통째로 비우는' 형태로 거짓 응답을 보낸다 —
+#  6/6 동일하게 0편. 다만 '목록은 주되 일부만 주는' 형태로 바뀔 수 있어
+#  사용자 지적(대한항공 유사 사례)에 따라 축소도 함께 본다.)
+# 프로세스 메모리에만 둔다 — 재시작하면 초기화되고, 그래도 0건 규칙이 남는다.
+_ROW_BASELINE: Dict[str, int] = {}
 
 
 # ─────────────────── form helpers ───────────────────
@@ -689,10 +698,24 @@ def submit_search(page: Page) -> List[Dict[str, Any]]:
     # -8002 안내 모달 / 팝업 처리 (popup 핸들러는 자동으로 동작, 메인 모달은 여기서)
     dismissed = dismiss_macro_notice(page)
     if dismissed:
-        LOGGER.info("매크로 안내 dismiss 됨 — 이번 iteration 은 빈 결과로 반환")
-        return []
+        raise GuardBlocked(
+            "매크로 안내 모달(-8002/-8003) 감지 — 조회 결과를 믿을 수 없음",
+            explicit=True,
+        )
 
     return _parse_result_rows(page)
+
+
+def _empty_marker_visible(page: Page) -> bool:
+    """'해당 스케줄에 운행하는 열차가 없습니다' 마커가 실제로 떠 있는지."""
+    try:
+        return page.locator(S.RESULT_EMPTY_MARKER).first.is_visible(timeout=1500)
+    except Exception:
+        pass
+    try:
+        return S.RESULT_EMPTY_TEXT in page.locator("body").inner_text(timeout=2000)
+    except Exception:
+        return False
 
 
 def _expand_more_until(
@@ -766,8 +789,10 @@ def perform_search(
         human_pause(1.5, 2.5)
         dismissed = dismiss_macro_notice(page)
         if dismissed:
-            LOGGER.info("매크로 안내 dismiss 됨 (reload) — 이번 iteration 빈 결과")
-            return []
+            raise GuardBlocked(
+                "매크로 안내 모달(-8002/-8003) 감지 (reload) — 조회 결과를 믿을 수 없음",
+                explicit=True,
+            )
         _ensure_srt_on_result(page, config)
         try:
             raw = _parse_result_rows(page)
@@ -808,6 +833,42 @@ def perform_search(
 
     # 감시 대상 최댓 시각까지 '더보기' 확장 (첫 화면엔 일부 행만 로드됨)
     raw = _expand_more_until(page, config, raw)
+
+    # ── 조용한 차단 감지 (2026-11-03 실측) ──────────────────────────────
+    # CDP 세션이 붙으면 코레일이 모달 없이 열차 목록 자체를 비워 보낸다.
+    # '전부 매진' 과는 다르다 — 매진이면 row 는 나오고 status 만 '매진' 이다.
+    # row 가 0 인데 no-data 마커가 떠 있으면 차단이거나 조회 조건이 잘못된 것.
+    # 둘 다 "계속 폴링해도 의미 없음" 이므로 호출자에게 올린다.
+    # 판정 규칙은 '문구 매칭' 이 아니라 **결과의 타당성** 이다.
+    # 정상적인 조회는 실재하는 구간이면 row 가 나온다 — 전부 매진이어도 나온다.
+    # 따라서 row 0 건은 그 자체로 비정상이며, 차단 형태(모달/조용/미지의 변형)를
+    # 일일이 알아볼 필요가 없다. 사이트가 문구·코드·마커를 바꿔도 이 규칙은 유지된다.
+    # 유일한 오탐은 '실제로 운행이 없는 구간/날짜' 인데, 그 경우도 폴링은 무의미하므로
+    # 멈추는 편이 옳다 (메시지에 두 가능성을 함께 적는다).
+    if not raw:
+        marker = "no-data 마커 확인" if _empty_marker_visible(page) else \
+                 "no-data 마커 없음 (사이트 표시 변경 가능성)"
+        raise GuardBlocked(
+            f"열차 목록 0건 ({config.ktxa_origin}→{config.ktxa_dest} "
+            f"{config.ktxa_date.isoformat()}, {marker}) — 차단 의심 또는 조회 조건 오류",
+            explicit=False,
+        )
+
+    # ── 이번 실행의 다른 응답들과 비교 ───────────────────────────────────
+    # 목록은 주는데 전보다 확 줄었다면 '부분 응답' 조작을 의심한다.
+    # 오늘 날짜는 시간이 지나며 지난 열차가 빠져 자연히 줄므로 검사하지 않는다.
+    # 기준선이 충분히 쌓였을 때(4편 이상)만, 절반 미만으로 떨어진 경우만 본다 —
+    # 느슨하게 잡아야 정상 변동(더보기 로딩 등)에 오탐이 안 난다.
+    bkey = f"{config.ktxa_origin}|{config.ktxa_dest}|{config.ktxa_date.isoformat()}"
+    prev = _ROW_BASELINE.get(bkey, 0)
+    if config.ktxa_date != _date.today() and prev >= 4 and len(raw) < prev // 2:
+        raise GuardBlocked(
+            f"열차 목록이 급감 ({prev}편 → {len(raw)}편, {bkey}) — 부분 응답 조작 의심",
+            explicit=False,
+        )
+    if len(raw) > prev:
+        _ROW_BASELINE[bkey] = len(raw)
+        LOGGER.debug("기준선 갱신: %s = %d편", bkey, len(raw))
 
     # 사용자 선호 시간/좌석 매칭 후보로 압축
     # KTXA_SEAT_CLASS 가 비어 있으면 일반실+특실 둘 다 후보로 만든다 (ANY).

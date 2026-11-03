@@ -10,7 +10,7 @@ import sys
 
 from .chrome_launcher import ChromeLauncher
 from .config import ConfigError, load_config
-from .korail import CaptchaDetected, LoginError, SiteLayoutChanged
+from .korail import CaptchaDetected, GuardBlocked, LoginError, SiteLayoutChanged
 from .korail.client import KorailSPAClient
 from .korail.reserve import ensure_logged_in
 from .korail.search import perform_search
@@ -69,6 +69,12 @@ def main() -> int:
             candidates = perform_search(client, config)
     except LoginError as e:
         err = ("LoginError", str(e))
+    except GuardBlocked as e:
+        # 예상 못한 오류가 아니라 '차단' 이다 — traceback 없이 명확히 보고.
+        err = ("GuardBlocked", str(e))
+        print(f"[smoke_test] BLOCKED: {e}")
+        print("[smoke_test] → '열차 없음/매진' 이 아니라 조회가 차단된 상태입니다.")
+        log.warning("GuardBlocked: %s", e)
     except CaptchaDetected as e:
         err = ("CaptchaDetected", str(e))
         log.warning("Captcha: %s", e)

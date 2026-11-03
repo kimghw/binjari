@@ -11,7 +11,7 @@ from typing import Dict, List
 
 from .chrome_launcher import ChromeLauncher
 from .config import ConfigError, KTXAConfig, load_config
-from .korail import CaptchaDetected, LoginError, ReservationFailed, SiteLayoutChanged, UserActionRequired
+from .korail import CaptchaDetected, GuardBlocked, LoginError, ReservationFailed, SiteLayoutChanged, UserActionRequired
 from .korail import payment as payment_mod
 from .korail import reserve as reserve_mod
 from .korail import search as search_mod
@@ -64,6 +64,42 @@ def _sleep_with_jitter(min_s: float, max_s: float) -> None:
     delay = min_s + random.uniform(0, max(0.0, max_s - min_s))
     LOGGER.info("다음 검색까지 %.2fs 대기", delay)
     time.sleep(delay)
+
+
+class _SearchStats:
+    """조회 성공/차단 집계 — '실제로 얼마나 차단당하는지' 를 운영 중에 자동으로 쌓는다.
+
+    추가 요청을 전혀 보내지 않는다. 평소 폴링의 결과만 센다
+    (인위적 측정은 사이트가 금지한 자동 요청을 늘리는 일이라 하지 않는다).
+
+    집계 대상은 '결과가 확정된' 조회뿐 — 성공(목록 읽힘) + 차단(목록 비어 돌아옴).
+    네트워크 오류 등 판정 불가 예외는 세지 않는다.
+    """
+
+    def __init__(self) -> None:
+        self.ok = 0
+        self.blocked = 0
+        self.last_ok: str | None = None
+
+    @property
+    def total(self) -> int:
+        return self.ok + self.blocked
+
+    def record_ok(self) -> None:
+        self.ok += 1
+        self.last_ok = time.strftime("%H:%M:%S")
+
+    def record_blocked(self) -> None:
+        self.blocked += 1
+
+    def summary(self) -> str:
+        if not self.total:
+            return "조회 기록 없음"
+        pct = round(self.blocked * 100 / self.total)
+        return (
+            f"조회 {self.total}회 중 차단 {self.blocked}회 ({pct}%), "
+            f"마지막 정상 조회: {self.last_ok or '없음'}"
+        )
 
 
 def _maybe_transfer(
@@ -128,7 +164,9 @@ def run_once(
     """Return True 면 main loop 종료."""
     candidates: List[Dict] = search_mod.perform_search(client, config)
     if not candidates:
-        LOGGER.info("후보 없음 (-8002 dismiss 됐을 수 있음). 다음 iteration 진행")
+        # 차단이면 perform_search 가 GuardBlocked 를 올린다 — 여기 오면 목록은 읽혔고
+        # 조건에 맞는 빈자리가 없을 뿐이다 (전부 매진 등). 정상 감시 상태.
+        LOGGER.info("후보 없음 (조건에 맞는 빈자리 없음 — 전부 매진 등). 다음 iteration 진행")
         return False
 
     # 이미 확보한 출발시각은 재시도하지 않는다 (다중 감시)
@@ -274,6 +312,8 @@ def main() -> int:
         return 1
 
     # 2) Korail SPA 클라이언트
+    # 조회 성공/차단 집계 (종료 시 요약 보고) — with 블록 밖에서도 읽어야 해서 여기서 선언.
+    stats = _SearchStats()
     try:
         with KorailSPAClient(cdp_url) as client:
             if config.ktxa_mode == "reserve":
@@ -283,9 +323,18 @@ def main() -> int:
                     LOGGER.error("로그인 실패: %s", e)
                     return 1
 
+            # 연속 차단 횟수. 정상 조회(열차 목록이 나오면)가 한 번이라도 되면 0 으로 리셋.
+            block_strikes = 0
+
             while not _STOP:
                 try:
                     done = run_once(client, config, notifier)
+                    # 여기까지 왔으면 열차 목록은 읽혔다 (후보 0건 = 전부 매진은 정상 상태)
+                    stats.record_ok()
+                    if block_strikes:
+                        LOGGER.info("조회 정상 복구 — 차단 카운터 리셋 (직전 %d회)", block_strikes)
+                        _notify(notifier, f"✅ 조회 정상 복구 — 감시 계속\n{stats.summary()}")
+                        block_strikes = 0
                     if done:
                         return 0
                     if config.ktxa_once:
@@ -295,6 +344,31 @@ def main() -> int:
                         float(config.ktxa_poll_min),
                         float(config.ktxa_poll_max),
                     )
+                except GuardBlocked as e:
+                    block_strikes += 1
+                    stats.record_blocked()
+                    kind = "매크로 안내 모달(-8002/-8003)" if e.explicit else "모달 없이 빈 목록"
+                    limit = config.ktxa_block_strikes
+                    LOGGER.warning(
+                        "차단 감지 [%d/%s] %s: %s | %s",
+                        block_strikes, limit or "무제한", kind, e, stats.summary(),
+                    )
+                    if block_strikes == 1:
+                        _notify(notifier, f"⚠ 조회 차단 의심 ({kind}) — 재확인 중\n{e}")
+                    if limit and block_strikes >= limit:
+                        LOGGER.error("연속 %d회 차단 — 감시 중단", block_strikes)
+                        _notify(
+                            notifier,
+                            f"🛑 감시 중단 — 조회가 차단된 것으로 판단됩니다 (연속 {block_strikes}회, {kind}).\n"
+                            f"📊 {stats.summary()}\n"
+                            "※ '매진' 이 아니라 **열차 목록 자체를 못 읽는** 상태입니다. "
+                            "이대로 계속 돌려도 빈자리를 잡을 수 없어 중단했습니다.\n"
+                            "조치: Chrome 을 완전히 종료 후 다시 띄우고, 사람이 직접 조회해 "
+                            "정상인지 확인하세요. 조회 조건(역/날짜)도 함께 확인하세요.\n"
+                            f"({e})",
+                        )
+                        return 1
+                    _sleep_with_jitter(5.0, 12.0)
                 except CaptchaDetected as e:
                     LOGGER.warning("Captcha: %s — backoff", e)
                     _sleep_with_jitter(5.0, 12.0)
@@ -305,7 +379,9 @@ def main() -> int:
                     LOGGER.warning("iteration 일시 예외 (%s: %s) — backoff 후 재시도", type(e).__name__, e)
                     _sleep_with_jitter(5.0, 12.0)
     finally:
+        # 어떤 경로로 끝나든(예약 성공/차단 중단/예외) 집계는 남긴다.
         launcher.shutdown_if_owned()
+        LOGGER.info("조회 집계 — %s", stats.summary())
 
     LOGGER.info("Watcher stopped")
     return 0

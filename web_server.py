@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field
 from ktx_watcher.chrome_launcher import ChromeLauncher
 from ktx_watcher.config import KTXAConfig
 from ktx_watcher.korail.client import KorailSPAClient
+from ktx_watcher.korail import GuardBlocked
 from ktx_watcher.korail import search as ktx_search
 
 
@@ -364,8 +365,19 @@ def _ktx_list_schedules(req: SearchRequest) -> Dict[str, Any]:
                        "감시를 중지 후 재조회하거나 저장된 시간표 범위로 조회하세요",
             )
         config = _build_ktxa_config(req)
-        with _KTX_LOCK:
-            rows_all = _live_fetch(config)
+        try:
+            with _KTX_LOCK:
+                rows_all = _live_fetch(config)
+        except GuardBlocked as e:
+            # 빈 목록을 '열차 없음' 으로 캐시하면 오답이 굳는다 — 캐시하지 않고 에러로 알린다.
+            LOGGER.warning("시간표 조회 차단 감지: %s", e)
+            raise HTTPException(
+                status_code=503,
+                detail="코레일이 조회를 차단했습니다 — 열차 목록 자체를 읽지 못했습니다. "
+                       "('열차 없음' 이 아니라 차단입니다) "
+                       "Chrome 을 완전히 종료 후 다시 시도하고, 브라우저에서 직접 조회해 "
+                       "정상인지 확인하세요.",
+            ) from e
         fetched_at = datetime.now().strftime("%H:%M")
         with _CACHE_LOCK:
             cache = _cache_load()
@@ -2053,19 +2065,18 @@ async function callOne(rail, body) {{
   return r.json();
 }}
 
-// ── 열차 종류 필터: 기본 KTX(산천 포함)·SRT, 나머지는 토글로 추가 ──
-const TYPE_ORDER = ['KTX', 'SRT', 'ITX-새마을', 'ITX-마음', 'ITX-청춘', '무궁화·누리로', '기타'];
+// ── 열차 종류 필터: 기본 KTX(산천·SRT 포함), 나머지는 토글로 추가 ──
+const TYPE_ORDER = ['KTX', 'ITX-새마을', 'ITX-마음', 'ITX-청춘', '무궁화·누리로', '기타'];
 let typeFilter = (function () {{
   try {{
-    const v = JSON.parse(localStorage.getItem('binjari_types') || '["KTX","SRT"]');
-    return new Set(Array.isArray(v) && v.length ? v : ['KTX', 'SRT']);
-  }} catch (e) {{ return new Set(['KTX', 'SRT']); }}
+    const v = JSON.parse(localStorage.getItem('binjari_types') || '["KTX"]');
+    return new Set(Array.isArray(v) && v.length ? v : ['KTX']);
+  }} catch (e) {{ return new Set(['KTX']); }}
 }})();
 
 function trainGroup(t) {{
   t = (t || '').toUpperCase();
-  if (t.startsWith('KTX')) return 'KTX';
-  if (t.startsWith('SRT')) return 'SRT';
+  if (t.startsWith('KTX') || t.startsWith('SRT')) return 'KTX';  // 2026-11 SRT 는 KTX 에 통합
   if (t.includes('새마을')) return 'ITX-새마을';
   if (t.includes('마음')) return 'ITX-마음';
   if (t.includes('청춘')) return 'ITX-청춘';
@@ -2194,6 +2205,8 @@ async function saveTrains(rows) {{
         KTXA_TIMES: times.join(','),
         KTXA_TRAIN_NO: nos.join(','),
         KTXA_PASSENGERS: f.passengers.value,
+        // SRT(수서 발착) 열차를 골랐으면 감시 때 '수서 함께 보기' 가 켜져 있어야 보인다
+        ...(rows.some(r => /^SRT/i.test(r.train_type || '')) ? {{ KTXA_INCLUDE_SRT: 'true' }} : {{}}),
       }} }}),
     }});
     const data = await resp.json();
@@ -2410,7 +2423,7 @@ SETTINGS_HTML = """
       <div class="field"><label>가는 날</label>
         <input id="KTXA_DATE" type="date"></div>
     </div>
-    <!-- ─ 시간표 조회 (출발 시각 + N시간, KTX·SRT 기본) ─ -->
+    <!-- ─ 시간표 조회 (출발 시각 + N시간, KTX(SRT 포함) 기본) ─ -->
     <div class="row journey-divider">
       <div class="field"><label>출발 시각</label>
         <div style="display:flex; gap:6px; align-items:center;">
@@ -2423,8 +2436,7 @@ SETTINGS_HTML = """
         <select id="TW_HOURS"></select></div>
       <div class="field"><label>열차 종류</label>
         <div class="action-cluster">
-          <label class="check" style="padding:0"><input type="checkbox" id="LOAD_KTX" checked>KTX(산천·청룡)</label>
-          <label class="check" style="padding:0"><input type="checkbox" id="LOAD_SRT" checked>SRT</label>
+          <label class="check" style="padding:0"><input type="checkbox" id="LOAD_KTX" checked>KTX(산천·청룡·SRT)</label>
           <label class="check" style="padding:0"><input type="checkbox" id="LOAD_ETC">기타(ITX·무궁화)</label>
         </div>
       </div>
@@ -2781,6 +2793,11 @@ function renderTimes() {
   // 남은 칩의 열차번호를 좌석·열차 섹션(KTXA_TRAIN_NO)에 바로 반영
   const nos = times.map(t => (timeInfo[t] || {}).train_no).filter(Boolean);
   if (nos.length) document.getElementById('KTXA_TRAIN_NO').value = nos.join(',');
+  // SRT(수서 발착) 열차가 들어 있으면 감시 때 '수서 함께 보기' 가 켜져 있어야 보인다
+  if (times.some(t => /^SRT/i.test((timeInfo[t] || {}).train_type || ''))) {
+    const inc = document.getElementById('KTXA_INCLUDE_SRT');
+    if (inc && !inc.checked) { inc.checked = true; formDirty = true; }
+  }
   const hint = document.getElementById('rangeHint');
   if (hint) {
     const tol = parseInt(document.getElementById('KTXA_TOLERANCE_MIN').value, 10) || 0;
@@ -2800,8 +2817,7 @@ function delTime(t) { times = times.filter(x => x !== t); renderTimes(); formDir
 // ── 날짜·출발시각·조회시간 범위의 열차를 불러와 칩으로 나열 (force=사이트 재조회) ──
 function loadGroupOk(t) {
   t = (t || '').toUpperCase();
-  if (t.startsWith('KTX')) return document.getElementById('LOAD_KTX').checked;
-  if (t.startsWith('SRT')) return document.getElementById('LOAD_SRT').checked;
+  if (t.startsWith('KTX') || t.startsWith('SRT')) return document.getElementById('LOAD_KTX').checked;  // SRT 는 KTX 에 통합
   return document.getElementById('LOAD_ETC').checked;
 }
 
@@ -2838,7 +2854,7 @@ async function loadRangeTrains(force) {
         latest_hour: twN === '' ? null : Math.min(Math.ceil(endMin / 60), 24),
         passengers: 1,
         force: !!force,
-        include_srt: document.getElementById('LOAD_SRT').checked,
+        include_srt: true,  // 2026-11 SRT 는 KTX 에 통합 — 수서 발착 포함 조회
       }),
     });
     const data = await r.json();

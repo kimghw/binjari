@@ -80,6 +80,9 @@ class KTXAConfig(BaseModel):
     ktxa_poll_min: int = Field(3, alias="KTXA_POLL_MIN")
     ktxa_poll_max: int = Field(10, alias="KTXA_POLL_MAX")
     ktxa_once: bool = Field(False, alias="KTXA_ONCE")
+    # 차단(열차 목록 자체가 비어 돌아옴) 이 연속 몇 번이면 감시를 중단할지.
+    # 0 이면 중단하지 않고 경고만 (권장 안 함 — 차단 중엔 폴링이 무의미).
+    ktxa_block_strikes: int = Field(3, alias="KTXA_BLOCK_STRIKES")
 
     # ─ Misc ─
     ktxa_mode: str = Field("search", alias="KTXA_MODE")

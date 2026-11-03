@@ -2,9 +2,13 @@
 
 실행::
 
-    python3 -m uvicorn web_server:app --host 0.0.0.0 --port 8000
+    python3 -m uvicorn web_server:app --host 127.0.0.1 --port 8001
 
-브라우저에서 http://localhost:8000 접속 → 폼 입력 → 조회.
+브라우저에서 http://localhost:8001 접속 → 폼 입력 → 조회.
+
+이 서버는 **로컬(owner) 전용** — .env.ktx 실값(로그인·카드)을 다루므로
+반드시 127.0.0.1 에만 바인딩한다. 외부(모바일) 접속은 별도의
+web_external.py (Azure 로그인 게이트, Caddy 뒤) 가 담당한다.
 
 기존 ktx_watcher 의 Playwright 검색 모듈을 재사용하지만
 필터(좌석 잔여/시간 허용) 는 풀어 두어 해당 날짜의 *모든* 스케줄을 반환한다.
@@ -1001,7 +1005,6 @@ button.tchip.on {
 
 table {
   width: 100%;
-  min-width: 680px;
   border-spacing: 0;
   border-collapse: separate;
   font-size: 13px;
@@ -1009,7 +1012,7 @@ table {
 
 th,
 td {
-  padding: 13px 14px;
+  padding: 11px 10px;
   border: 0;
   border-bottom: 1px solid var(--line);
   text-align: left;
@@ -1061,8 +1064,15 @@ tbody tr.is-selected td {
   white-space: nowrap;
 }
 
+.train-cell {
+  text-align: center;
+}
+
 .train-number {
+  display: block;
+  margin-top: 3px;
   color: var(--text-secondary);
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -1074,8 +1084,33 @@ tbody tr.is-selected td {
   letter-spacing: -.02em;
 }
 
+.time-cell .arr {
+  color: var(--text-tertiary);
+  font-size: 12px;
+  font-weight: 500;
+}
+
 .seat-cell {
   color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+/* 시간표 조회에서 가격·적립 상세는 부차 정보 — 잔여가 남은 좌석 유형만
+   회색 알약으로 표시한다 (둘 다 매진이면 – ). 전체 문구는 title 로 유지. */
+.seat-tag {
+  display: block;
+  width: fit-content;
+  margin: 2px 0;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: rgba(120, 120, 128, .12);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 680;
+}
+
+.seat-none {
+  color: var(--text-tertiary);
 }
 
 .empty {
@@ -2069,23 +2104,26 @@ function renderResult() {{
   updateSelBar();
 }}
 
+function seatTag(label, txt) {{
+  const t = (txt || '').trim();
+  const ok = /원|가능/.test(t) && t !== '매진';
+  return ok ? `<span class="seat-tag" title="${{escapeHtml(t)}}">${{label}}</span>` : '';
+}}
+
 function renderRows(rows) {{
   if (!rows || rows.length === 0) return '';
   window.lastRows = rows;
   const head = `<tr>
     <th scope="col"><input type="checkbox" id="selAll" onchange="toggleAll(this.checked)" aria-label="검색 결과 전체 선택"></th>
-    <th scope="col">열차</th><th scope="col">번호</th>
-    <th scope="col">출발</th><th scope="col">도착</th><th scope="col">특실</th><th scope="col">일반실</th>
+    <th scope="col">열차</th>
+    <th scope="col">출발·도착</th><th scope="col">좌석</th>
   </tr>`;
   const body = rows.map((r, i) => `<tr onclick="rowToggle(event, ${{i}})" style="cursor:pointer;">
     <td><input type="checkbox" class="selrow" data-i="${{i}}" onchange="updateSelBar()"
       aria-label="${{escapeHtml(r.train_type)}} ${{escapeHtml(r.train_no)}} ${{escapeHtml(r.depart)}} 출발 선택"></td>
-    <td><span class="train-badge">${{escapeHtml(r.train_type)}}</span></td>
-    <td class="train-number">${{escapeHtml(r.train_no)}}</td>
-    <td class="time-cell">${{escapeHtml(r.depart)}}</td>
-    <td class="time-cell">${{escapeHtml(r.arrive)}}</td>
-    <td class="seat-cell">${{escapeHtml(r.first)}}</td>
-    <td class="seat-cell">${{escapeHtml(r.general)}}</td>
+    <td class="train-cell"><span class="train-badge">${{escapeHtml(r.train_type)}}</span><span class="train-number">${{escapeHtml(r.train_no)}}</span></td>
+    <td class="time-cell"><div class="dep">${{escapeHtml(r.depart)}}</div><div class="arr">${{escapeHtml(r.arrive)}}</div></td>
+    <td class="seat-cell">${{seatTag('특실', r.first) + seatTag('일반실', r.general) || '<span class="seat-none">–</span>'}}</td>
   </tr>`).join('');
   return `<div class="table-wrap"><table aria-label="조회된 열차 시간표">
       <caption class="sr-only">조회 조건에 맞는 열차 시간표</caption>
@@ -3895,4 +3933,4 @@ def healthz() -> Dict[str, str]:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8001)

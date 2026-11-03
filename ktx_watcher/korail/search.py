@@ -600,47 +600,51 @@ def navigate_to_search(client: KorailSPAClient) -> Page:
 
 
 def _set_srt_option(page: Page, config: KTXAConfig) -> None:
-    """검색 폼의 '에스알티(SRT) 함께 보기' 라디오를 켠다 (KTXA_INCLUDE_SRT=true 일 때).
+    """검색 폼의 '서울·용산 - 수서 함께 보기' 라디오를 config 에 맞춰 Y/N 으로 둔다.
 
+    2026-11-03: 사이트에서 SRT 가 KTX 탭에 통합되며 'SRT 함께 보기' 는 사라졌고,
+    수서 발착(SRT) 열차는 이 옵션으로 포함된다. SPA 가 폼 값을 세션 내 유지하므로
+    include_srt=false 일 때도 N 을 명시해야 이전 조회의 Y 가 남지 않는다.
     라디오가 든 옵션 영역(.selectAreaWrap.inline)이 display:none 이라
     Playwright click 이 불가 → JS click (hidden 이어도 change 이벤트 발생, React 반영 확인됨).
     """
-    if not config.ktxa_include_srt:
-        return
+    want = bool(config.ktxa_include_srt)
+    sel = S.SRT_RADIO_Y if want else S.SRT_RADIO_N
     try:
         state = page.evaluate(
             """(sel) => {
-                const y = document.querySelector(sel);
-                if (!y) return 'missing';
-                if (y.checked) return 'already';
-                y.click();
-                return y.checked ? 'set' : 'FAIL';
+                const r = document.querySelector(sel);
+                if (!r) return 'missing';
+                if (r.checked) return 'already';
+                r.click();
+                return r.checked ? 'set' : 'FAIL';
             }""",
-            S.SRT_RADIO_Y,
+            sel,
         )
     except Exception as e:
-        LOGGER.warning("SRT 함께 보기 설정 실패 (계속 진행): %s", e)
+        LOGGER.warning("수서(SRT) 함께 보기 설정 실패 (계속 진행): %s", e)
         return
     if state in ("missing", "FAIL"):
-        LOGGER.warning("SRT 함께 보기 라디오 적용 실패: %s — site layout 변경 가능", state)
+        LOGGER.warning("수서(SRT) 함께 보기 라디오 적용 실패: %s — site layout 변경 가능", state)
     else:
-        LOGGER.info("SRT 함께 보기 ON (%s)", state)
+        LOGGER.info("수서(SRT) 함께 보기 %s (%s)", "ON" if want else "OFF", state)
 
 
-def _ensure_srt_on_result(page: Page) -> None:
-    """결과 페이지(search/list)의 SRT 체크박스가 풀려 있으면 다시 켠다 (클릭 시 자동 재조회)."""
+def _ensure_srt_on_result(page: Page, config: KTXAConfig) -> None:
+    """결과 페이지(search/list)의 '수서 함께 보기' 체크박스를 config 에 맞춘다 (클릭 시 자동 재조회)."""
+    want = bool(config.ktxa_include_srt)
     try:
         cb = page.locator(S.SRT_RESULT_CHECKBOX).first
-        if cb.count() == 0 or cb.is_checked():
+        if cb.count() == 0 or cb.is_checked() == want:
             return
         try:
             page.locator(S.SRT_RESULT_CHECKBOX_LABEL).first.click(timeout=3000)
         except Exception:
             page.evaluate("(sel) => document.querySelector(sel)?.click()", S.SRT_RESULT_CHECKBOX)
         human_pause(1.5, 2.5)
-        LOGGER.info("결과 페이지 SRT 함께 보기 재활성화")
+        LOGGER.info("결과 페이지 수서(SRT) 함께 보기 %s", "재활성화" if want else "해제")
     except Exception as e:
-        LOGGER.warning("결과 페이지 SRT 체크 확인 실패 (계속 진행): %s", e)
+        LOGGER.warning("결과 페이지 수서(SRT) 체크 확인 실패 (계속 진행): %s", e)
 
 
 def fill_search_form(page: Page, config: KTXAConfig) -> None:
@@ -764,8 +768,7 @@ def perform_search(
         if dismissed:
             LOGGER.info("매크로 안내 dismiss 됨 (reload) — 이번 iteration 빈 결과")
             return []
-        if config.ktxa_include_srt:
-            _ensure_srt_on_result(page)
+        _ensure_srt_on_result(page, config)
         try:
             raw = _parse_result_rows(page)
         except Exception as e:
@@ -846,9 +849,10 @@ def perform_search(
                 kind = "standing"
             else:
                 continue
-            # SRT row 는 코레일 내 결제 불가 ('예매링크' → SRT 사이트 이동, 실측 2026-08-18)
-            # → 알림 전용 후보로 표시. main 루프가 예약 시도 없이 Teams 알림만 보낸다.
-            if r["train_name"].upper().startswith("SRT"):
+            # SRT row: 예전엔 코레일 내 결제 불가 ('예매링크' → SRT 사이트 이동, 실측 2026-08-18)
+            # → 알림 전용 후보. 2026-11-03 SRT 가 KTX 탭에 통합된 뒤로는 행 내용으로 판정 —
+            # '예매링크' 가 실제로 있을 때만 알림 전용, 가격이 떠 있으면 일반 예약 후보로 진행.
+            if r["train_name"].upper().startswith("SRT") and "예매링크" in r["depart_raw"]:
                 kind = "srt_link"
             # 좌석 직행만: 입석+좌석/예약대기 후보 제외 (srt_link 는 알림용이라 유지)
             if config.ktxa_seated_only and kind not in ("reserve", "srt_link"):
@@ -874,9 +878,10 @@ def perform_search(
 
 
 # 열차종류 → row 열차명 매칭 키워드 (TRAIN_TYPE_TAB 의 탭 그룹과 동일 구성)
+# 2026-11-03: 사이트에서 SRT 가 KTX 탭에 통합 → KTX 그룹에 SRT 포함 (수서 함께 보기 ON 일 때 섞여 나옴)
 _TRAIN_TYPE_GROUPS = {
-    "KTX": ("KTX", "청룡"),
-    "KTX-산천": ("KTX", "청룡"),
+    "KTX": ("KTX", "청룡", "SRT"),
+    "KTX-산천": ("KTX", "청룡", "SRT"),
     "새마을": ("새마을",),
     "ITX-새마을": ("새마을",),
     "무궁화": ("무궁화", "누리로"),

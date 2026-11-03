@@ -190,7 +190,7 @@ class SearchRequest(BaseModel):
     train_no: str = Field("", description="열차번호로 필터 (예: 101, 비우면 전체)")
     passengers: int = Field(1, ge=1, le=9)
     force: bool = Field(False, description="true 면 캐시 무시하고 사이트 재조회")
-    include_srt: Optional[bool] = Field(None, description="사이트 조회 시 'SRT 함께 보기' (None 이면 .env.ktx 값)")
+    include_srt: Optional[bool] = Field(None, description="사이트 조회 시 '서울·용산 - 수서 함께 보기'(SRT 포함) (None 이면 .env.ktx 값)")
 
 
 def _parse_date(s: str) -> _date:
@@ -260,6 +260,7 @@ def _live_fetch(config: KTXAConfig) -> List[Dict[str, Any]]:
     with KorailSPAClient(cdp_url) as client:
         page = ktx_search.navigate_to_search(client)
         ktx_search.fill_search_form(page, config)
+        ktx_search._set_srt_option(page, config)
         raw = ktx_search.submit_search(page)
         # 사이트가 방금 채운 조건인데도 '운행하는 열차가 없습니다' 를 내는 일시 상태가
         # 있다 (2026-08-18 CDP 캡쳐로 확인, 새로고침 시 정상). 최대 2회 재시도.
@@ -337,6 +338,8 @@ def _cache_purge(cache: Dict[str, Any]) -> None:
 def _ktx_list_schedules(req: SearchRequest) -> Dict[str, Any]:
     """시간표 반환. 캐시가 요청 범위를 덮으면 재조회 없이 캐시 사용 (force 로 무시)."""
     key = f"{req.origin.strip()}|{req.dest.strip()}|{req.date}"
+    want_srt = (req.include_srt if req.include_srt is not None
+                else _read_env_values().get("KTXA_INCLUDE_SRT", "false").lower() == "true")
 
     with _CACHE_LOCK:
         cache = _cache_load()
@@ -346,6 +349,7 @@ def _ktx_list_schedules(req: SearchRequest) -> Dict[str, Any]:
             not req.force
             and entry is not None
             and entry.get("from_hour", 99) <= req.earliest_hour
+            and (entry.get("include_srt", False) or not want_srt)
         )
         _cache_save(cache)  # purge(지난 날짜·시각 삭제) 반영
         if usable:
@@ -369,6 +373,7 @@ def _ktx_list_schedules(req: SearchRequest) -> Dict[str, Any]:
             cache[key] = {
                 "origin": req.origin.strip(), "dest": req.dest.strip(), "date": req.date,
                 "from_hour": req.earliest_hour, "fetched_at": fetched_at, "rows": rows_all,
+                "include_srt": want_srt,
             }
             _cache_save(cache)
 
@@ -2031,6 +2036,7 @@ function payload() {{
     latest_hour:   f.latest_hour.value === '' ? null : parseInt(f.latest_hour.value, 10),
     train_no:      f.train_no.value.trim(),
     passengers:    parseInt(f.passengers.value, 10),
+    include_srt:   true,
   }};
 }}
 
@@ -2047,13 +2053,13 @@ async function callOne(rail, body) {{
   return r.json();
 }}
 
-// ── 열차 종류 필터: 기본 KTX(산천 포함)만, 나머지는 토글로 추가 ──
+// ── 열차 종류 필터: 기본 KTX(산천 포함)·SRT, 나머지는 토글로 추가 ──
 const TYPE_ORDER = ['KTX', 'SRT', 'ITX-새마을', 'ITX-마음', 'ITX-청춘', '무궁화·누리로', '기타'];
 let typeFilter = (function () {{
   try {{
-    const v = JSON.parse(localStorage.getItem('binjari_types') || '["KTX"]');
-    return new Set(Array.isArray(v) && v.length ? v : ['KTX']);
-  }} catch (e) {{ return new Set(['KTX']); }}
+    const v = JSON.parse(localStorage.getItem('binjari_types') || '["KTX","SRT"]');
+    return new Set(Array.isArray(v) && v.length ? v : ['KTX', 'SRT']);
+  }} catch (e) {{ return new Set(['KTX', 'SRT']); }}
 }})();
 
 function trainGroup(t) {{
@@ -2498,7 +2504,7 @@ SETTINGS_HTML = """
       <label class="check"><input type="checkbox" id="KTXA_SEATED_ONLY">
         좌석으로 한 번에 가는 열차만 (입석+좌석 / 예약대기 제외)</label>
       <label class="check"><input type="checkbox" id="KTXA_INCLUDE_SRT">
-        에스알티(SRT) 함께 보기</label>
+        서울·용산 - 수서 함께 보기 (SRT 포함)</label>
     </div>
   </section>
 

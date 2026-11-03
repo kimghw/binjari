@@ -216,8 +216,7 @@ _자동 생성 (page_inspect.py, 2026-05-14 10:54)_
 - `input[type=text]` **labelple** readonly value=`총 1명`
 - `input[type=checkbox]` **rtYn** value=`on`
 - `input[type=checkbox]` **adjStnScdlOfrFlg** value=`on`
-- `input[type=checkbox]` **srtCheckYn** value=`on`
-- `input[type=checkbox]` **adjStnScdlOfrFlg2** value=`on`
+- `input[type=checkbox]` **adjStnScdlOfrFlg2** value=`on` — "서울·용산 - 수서 함께 보기" (SRT 포함 옵션. 2026-11-03 확인: 이전 **srtCheckYn** 은 사라짐, SRT 는 KTX 탭에 통합)
 
 ---
 

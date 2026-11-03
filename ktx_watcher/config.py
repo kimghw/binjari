@@ -62,7 +62,7 @@ class KTXAConfig(BaseModel):
     # true 면 바로 좌석 예매 가능한 열차만 후보 (입석+좌석/예약대기 제외)
     ktxa_seated_only: bool = Field(False, alias="KTXA_SEATED_ONLY")
     ktxa_train_type: str = Field("KTX", alias="KTXA_TRAIN_TYPE")
-    # true 면 검색 시 "에스알티(SRT) 함께 보기" 옵션을 켠다 (수서 발착 SRT 열차 포함)
+    # true 면 검색 시 "서울·용산 - 수서 함께 보기" 옵션을 켠다 (수서 발착 SRT 포함; 2026-11 SRT 는 KTX 탭에 통합)
     ktxa_include_srt: bool = Field(False, alias="KTXA_INCLUDE_SRT")
     ktxa_tolerance_min: int = Field(0, alias="KTXA_TOLERANCE_MIN")
     # 확보 목표 건수: 감시 시각(열차) 중 몇 건을 예약하면 종료할지.

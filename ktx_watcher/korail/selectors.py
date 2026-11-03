@@ -19,13 +19,18 @@ DATE_INPUT = "input#startDate"
 DATE_PICKER_BTN = "a.btn_pop.btn_d-day"
 SEARCH_SUBMIT = "button.btn_lookup"
 SEARCH_FORM_DETECT = "button.btn_lookup, input[name='txtGoStart']"
-# "에스알티(SRT) 함께 보기" — VERIFIED 2026-08-18 (CDP DOM probe)
+# SRT 포함 옵션 — VERIFIED 2026-11-03 (CDP DOM probe)
+#   사이트에서 "에스알티(SRT) 함께 보기"(srtCheckYn) 가 사라지고 SRT 가 KTX 탭에 통합됨.
+#   수서 발착(SRT) 열차는 "서울·용산 - 수서 함께 보기"(adjStnScdlOfrFlg2) 로 포함한다.
 #   폼(search/general): 숨김 옵션 영역(.selectAreaWrap.inline, display:none) 안 라디오
-#     <input type="radio" name="srtCheckYn" value="Y|N"> (기본 N) → JS click 으로 토글
-#   결과(search/list): <input type="checkbox" id="srtCheckYn" name="srtCheckYn">
-SRT_RADIO_Y = "input[name='srtCheckYn'][value='Y']"
-SRT_RESULT_CHECKBOX = "input#srtCheckYn[type='checkbox']"
-SRT_RESULT_CHECKBOX_LABEL = "label[for='srtCheckYn']"
+#     <input type="radio" id="option05" name="adjStnScdlOfrFlg2" value="Y">  포함
+#     <input type="radio" id="option06" name="adjStnScdlOfrFlg2" value="N">  미포함
+#     → hidden 이라 JS click 으로 토글. SPA 가 폼 값을 세션 내 유지하므로 Y/N 둘 다 명시.
+#   결과(search/list): <input type="checkbox" id="adjStnScdlOfrFlg2"> + label[for] (클릭 시 재조회)
+SRT_RADIO_Y = "input[name='adjStnScdlOfrFlg2'][value='Y']"
+SRT_RADIO_N = "input[name='adjStnScdlOfrFlg2'][value='N']"
+SRT_RESULT_CHECKBOX = "input#adjStnScdlOfrFlg2[type='checkbox']"
+SRT_RESULT_CHECKBOX_LABEL = "label[for='adjStnScdlOfrFlg2']"
 
 # 인원 선택 팝업 — VERIFIED 2026-07-07 (CDP DOM probe)
 #   폼의 <a class="data btn_pop">총 1명</a> 클릭 → .layerWrap.personnel_pop_wrap

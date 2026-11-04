@@ -75,6 +75,11 @@ RESULT_PAGE_DETECT = ".sub_content.tab-tck_view, ul.tab_bar.type4, .tck_confirm_
 RESULT_EMPTY_TEXT = "해당 스케줄에 운행하는 열차가 없습니다"
 RESULT_EMPTY_MARKER = ".tck_confirm_no-data"
 
+# 목록 하단 '더보기' — button 이 아니라 anchor 다 (2026-11-04 CDP 실측):
+#   <a class="page_group"><span>더보기</span></a>
+# get_by_role("button", name="더보기") 는 0건이라 확장이 조용히 중단됐다.
+RESULT_MORE_BUTTON = "a.page_group:has-text('더보기')"
+
 # 열차 종류 필터 탭 — VERIFIED 2026-05-14 (CDP elementFromPoint probe)
 #   <ul class="tab_bar type4 clear fl-l">
 #     <li><button class="all">전체</button></li>

@@ -21,10 +21,24 @@
 
   ```bash
   uv sync            # 또는: pip install -e .
-  playwright install chromium
+  # 시스템 Chrome에 CDP로 연결하므로 별도 Chromium 설치는 필요하지 않습니다.
   ```
 
 ## 설정
+
+- 브라우저 연결은 `rebrowser-playwright`의 `addBinding` 모드를 사용하여
+  CDP `Runtime.enable`을 호출하지 않습니다. 조회·예매·결제와 웹 서버의 CDP
+  조작은 모두 `ktx_watcher.browser`를 사용합니다.
+  `REBROWSER_PATCHES_RUNTIME_FIX_MODE`는 연결을 시작할 때 `addBinding`으로 고정됩니다.
+  JavaScript 실행에 필요한 다른 `Runtime.*` 명령은 계속 사용합니다.
+  변경 후 `uv sync`를 실행하고 실행 중인 워처와 웹 서버를 재시작하세요.
+  동작 방식: [Rebrowser 공식 문서](https://github.com/rebrowser/rebrowser-patches#fix-runtimeenable-leak).
+- CDP 사용은 브라우저 연결과 실제 화면 조작에 집중합니다. `ktx_watcher.dom`이
+  입력값·본문·표시 중인 모달을 한 번에 읽고, 팝업은 context 핸들러 하나로 처리합니다.
+  불필요한 마우스 이동·hover·글자별 타이핑은 제거했으며 입력은 `fill`을 사용합니다.
+  동일 클라이언트의 연결과 메인 탭을 재사용하고, 탭 전환이 없으면 결과 재파싱을 생략합니다.
+  Playwright가 사용하는 CDP 연결과 내부 프로토콜 명령은 계속 필요합니다.
+  검증: `uv run pytest tests/test_browser_runtime.py -q -s`.
 
 - `.env.ktx.example` 을 `.env.ktx` 로 복사해 `<...>` 자리에 실값(로그인·카드·Azure)을 채웁니다.
   **실값 파일은 커밋 금지** — `.gitignore` 가 `.env.*` 전체를 차단하며 양식(`*.example`)만 커밋됩니다.

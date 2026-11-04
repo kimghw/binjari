@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import time as _time
 
-from playwright.sync_api import Page, TimeoutError as PWTimeoutError
+from ..browser import Page, TimeoutError as PWTimeoutError
 
 from ..config import KTXAConfig
 from . import SiteLayoutChanged, UserActionRequired

@@ -193,11 +193,12 @@
 - 모든 주요 클릭 (검색 / 예매 / 결제) 후 popup polling 을 충분히 (6~15회, 1s 간격) 돌림.
 - 단발 dismiss 가 아니라 polling 으로 지연/연속 popup 모두 커버.
 
-### F. 사람-유사 입력
-- `human_type` (sequential delay 80~170ms/char)
-- `human_click` (hover → pause 0.35~0.85s → click → pause 0.5~1.5s)
+### F. CDP 호출을 줄인 입력
+- `human_type` (`fill` 한 번으로 입력 후 대기)
+- `human_click` (실제 click → pause 0.5~1.5s)
 - `human_pause` (최소 0.5s 보장)
-- `human_mouse` (랜덤 좌표 이동 8~16 step)
+- 장식용 마우스 이동과 hover는 사용하지 않음.
+- 화면 읽기는 `ktx_watcher.dom.read_page_state`로 묶고 실제 클릭은 Playwright로 수행.
 
 ---
 

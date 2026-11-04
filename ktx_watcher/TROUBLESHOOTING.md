@@ -90,6 +90,30 @@ CDP 연결 / Chrome 환경 트러블은 [WORKFLOW.md §3-1](WORKFLOW.md#3-1-cdp-
 - 위치: `korail/payment.py:_set_card_year`
 - 미확정: 실제 어느 케이스가 default 인지 추가 검증 필요.
 
+## 13. -8002 매크로 안내가 1회성인데 dismiss 직후 차단으로 포기 ✓
+- 증상: 조회마다 `GuardBlocked` + "운행하는 열차가 없습니다", 후보 0건. 사람이 같은
+  창에서 refresh/조회를 누르면 정상 목록이 나옴 (2026-11-04 실측).
+- 원인: -8002 모달은 **첫 조회 제출에만** 뜬다. `submit_search` 가 모달을 닫은 직후
+  재조회 없이 `GuardBlocked` 를 던져, 가드가 이미 풀린 뒤에도 영구 0건.
+  네트워크 추적: 목록 XHR 자체가 안 나가고 `schedule.runDt` 까지만 호출됨 → 빈 목록은
+  서버의 "열차 없음" 이 아니라 가드가 끊은 흔적. (11-03 의 '모달 없이 조용한 차단' 도
+  dismiss 가 먼저 돌고 파싱한 같은 현상이었다.)
+- 해결: `_requery_after_guard` — dismiss 후 `button.btn_lookup` 재클릭 → 재파싱,
+  2회 재시도에도 0건일 때만 `GuardBlocked(explicit=True)`. 검색 제출·reload 경로 모두.
+- 참고: 로그인 단계에서도 같은 모달이 뜰 수 있는데 `ensure_logged_in` 은
+  `dismiss_macro_notice` 를 먼저 돌려 에러 문구를 `err=''` 로 잃는다. 원인 추적 시
+  dismiss **전에** 모달을 캡쳐할 것 (키워드 '안내 메세지' 가 일반 에러 모달도 삼킨다).
+- 위치: `korail/search.py:_requery_after_guard`, `submit_search`, `perform_search`
+
+## 14. '더보기' 가 button 이 아니라 anchor — 확장이 조용히 중단 ✓
+- 증상: `후보 0건 (전체 row 10건)`. 첫 화면 10행(05:13~07:27)만 파싱되고 KTXA_TIMES
+  (09:00) 구간은 아예 안 읽힘.
+- 원인: `page.get_by_role("button", name="더보기")` 가 0건. 실제 DOM 은
+  `<a class="page_group"><span>더보기</span></a>`. 루프가 debug 로그만 남기고 break.
+- 해결: `RESULT_MORE_BUTTON = "a.page_group:has-text('더보기')"`, 미발견 시 warning.
+  적용 후 10→40행, 양성 대조(TOLERANCE 240)에서 10:18 KTX 일반실 후보 추출 확인.
+- 위치: `korail/selectors.py:RESULT_MORE_BUTTON`, `korail/search.py:_expand_more_until`
+
 ---
 
 # 참조

@@ -15,7 +15,7 @@ import logging
 import time as _time
 from typing import Any, Dict
 
-from playwright.sync_api import Page, TimeoutError as PWTimeoutError
+from ..browser import Page, TimeoutError as PWTimeoutError
 
 from ..config import KTXAConfig
 from . import CaptchaDetected, LoginError, ReservationFailed, SiteLayoutChanged, UserActionRequired
@@ -25,7 +25,6 @@ from .client import (
     dismiss_all_popups,
     dismiss_macro_notice,
     human_click,
-    human_mouse,
     human_pause,
     human_type,
     safe_goto,
@@ -50,7 +49,6 @@ def ensure_logged_in(
     # 1) 메인 → 잠시 머무름 (자연스러운 세션 시그널)
     safe_goto(page, S.MAIN_URL, timeout_ms=30_000)
     human_pause(1.0, 2.0)
-    human_mouse(page)
 
     # 2)~6) 로그인 시도 — '복호화오류' (사이트 암호화 키 만료/깨짐, 2026-08-18 실측)
     # 는 페이지 새로고침 후 재입력하면 해소되는 일시 오류라 1회 재시도한다.
@@ -92,7 +90,6 @@ def ensure_logged_in(
         except PWTimeoutError as e:
             raise SiteLayoutChanged(f"로그인 입력 selector 실패: {e}") from e
 
-        human_mouse(page)
         human_pause(0.5, 1.0)
 
         # 5) 제출

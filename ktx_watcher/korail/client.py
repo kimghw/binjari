@@ -1,12 +1,12 @@
 """KorailSPAClient — CDP-only.
 
-이 클래스는 ``playwright.chromium.connect_over_cdp(cdp_url)`` 만 한다.
+이 클래스는 공통 browser API의 ``chromium.connect_over_cdp(cdp_url)`` 만 한다.
 자체 launch 경로는 없다.
 
 부가 책임:
-  - 매크로 안내 팝업(window.open) 자동 dismiss (page.on('popup'))
+  - 팝업 자동 dismiss (context.on('page') 한 곳에서 처리)
   - 일반 광고/공지 팝업 자동 close
-  - 사람-유사 click/pause/mouse 헬퍼
+  - 실제 클릭·일괄 입력과 동작 사이 대기
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from typing import Optional
 # playwright import 보다 *먼저* 해야 효과 있음.
 from .. import chrome_launcher as _cl  # noqa: F401  (side-effect import)
 
-from playwright.sync_api import (
+from ..browser import (
     Browser,
     BrowserContext,
     Page,
@@ -31,6 +31,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
+from ..dom import first_visible, read_page_state
 from . import selectors as S
 
 LOGGER = logging.getLogger("ktx_watcher_spa.korail.client")
@@ -52,118 +53,24 @@ def human_pause(min_s: float = 0.5, max_s: float = 1.2) -> None:
         time.sleep(random.uniform(lo, hi))
 
 
-def human_mouse(page: Page, moves: int = 3, viewport=(1440, 900)) -> None:
-    if not HUMANIZE:
-        return
-    w, h = viewport
-    for _ in range(moves):
-        try:
-            page.mouse.move(
-                random.randint(80, w - 80),
-                random.randint(80, h - 80),
-                steps=random.randint(8, 16),
-            )
-            time.sleep(random.uniform(0.08, 0.22))
-        except Exception:
-            return
-
-
-def human_click(loc, hover_first: bool = True) -> None:
-    """hover → pause → click → pause. bot 검사 통과 확률을 높이는 패턴."""
-    if HUMANIZE and hover_first:
-        try:
-            loc.hover()
-            time.sleep(random.uniform(0.35, 0.85))
-        except Exception:
-            pass
+def human_click(loc) -> None:
+    """Send only the actual click; retain pauses between user actions."""
     loc.click()
     if HUMANIZE:
         time.sleep(0.5 + random.uniform(0.0, 1.0))
 
 
-def human_type(loc, text: str, min_delay: int = 80, max_delay: int = 170) -> None:
-    """한 글자씩 typing delay 줘서 입력. fill() 보다 자연스러움."""
-    if not HUMANIZE:
-        loc.fill(text)
-        return
-    loc.click()
-    time.sleep(random.uniform(0.2, 0.5))
-    loc.press_sequentially(text, delay=random.randint(min_delay, max_delay))
-    time.sleep(random.uniform(0.25, 0.5))
-
-
-# ─────────────────── popup guard ───────────────────
-
-def _is_macro_notice_popup(popup: Page) -> bool:
-    """popup body 에 -8002/-8003 등 매크로 키워드가 있으면 True."""
-    try:
-        popup.wait_for_load_state("domcontentloaded", timeout=3000)
-        body_txt = popup.locator("body").inner_text(timeout=2000)
-    except Exception:
-        return False
-    return any(kw in body_txt for kw in S.MACRO_NOTICE_KEYWORDS)
+def human_type(loc, text: str) -> None:
+    """Fill once instead of issuing keyboard commands for every character."""
+    loc.fill(text)
+    if HUMANIZE:
+        time.sleep(random.uniform(0.25, 0.5))
 
 
 def _attach_popup_guard(page: Page) -> None:
-    """광고/공지 팝업은 자동 close, 매크로 안내 팝업은 '확인' 클릭."""
-    if getattr(page, "_popup_guard_attached", False):
-        return
+    """Use one context handler instead of handling each popup twice."""
+    attach_context_popup_guard(page.context)
 
-    def _on_popup(popup: Page) -> None:
-        popup_url = popup.url or "about:blank"
-
-        # popup 본문 확인 (load 대기)
-        body_txt = ""
-        try:
-            popup.wait_for_load_state("domcontentloaded", timeout=3000)
-            body_txt = popup.locator("body").inner_text(timeout=2000)
-        except Exception:
-            pass
-
-        is_macro = any(kw in body_txt for kw in S.MACRO_NOTICE_KEYWORDS)
-        # korail.com popup 이고 '확인' 버튼이 있는 안내성 모달이면 모두 dismiss
-        # (예: 이용안내, 본인인증 안내, 약관 등). 광고/외부 URL 만 close.
-        is_korail_info = ("korail" in popup_url) or any(
-            kw in body_txt for kw in ("안내", "이용안내", "확인하시고", "선택하신", "예매")
-        )
-
-        def _click_confirm() -> bool:
-            try:
-                time.sleep(random.uniform(0.5, 1.0))
-                btn = popup.locator(S.MODAL_CONFIRM_BUTTON).first
-                if btn.count() > 0:
-                    btn.click(timeout=3000)
-                    return True
-            except Exception as e:
-                LOGGER.debug("popup confirm click 실패: %s", e)
-            return False
-
-        if is_macro:
-            LOGGER.info("매크로 안내 popup → '확인' 클릭: %s", popup_url)
-            if not _click_confirm():
-                try:
-                    popup.close()
-                except Exception:
-                    pass
-            return
-
-        if is_korail_info:
-            LOGGER.info("정보 안내 popup → '확인' 클릭: %s body=%r", popup_url, body_txt[:80])
-            if _click_confirm():
-                return
-            # 확인 클릭 실패 → close
-        LOGGER.info("일반/광고 popup 자동 닫기: %s", popup_url)
-        try:
-            if not popup.is_closed():
-                popup.close()
-        except Exception:
-            pass
-
-    page.on("popup", _on_popup)
-    page._popup_guard_attached = True  # type: ignore[attr-defined]
-
-
-# ─────────────────── client ───────────────────
 
 class KorailSPAClient(AbstractContextManager["KorailSPAClient"]):
     """CDP-only Korail driver.
@@ -179,6 +86,7 @@ class KorailSPAClient(AbstractContextManager["KorailSPAClient"]):
         self._pw: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
+        self._main_page: Optional[Page] = None
 
     def __enter__(self) -> "KorailSPAClient":
         self.start()
@@ -188,6 +96,8 @@ class KorailSPAClient(AbstractContextManager["KorailSPAClient"]):
         self.stop()
 
     def start(self) -> None:
+        if self._browser is not None:
+            return
         self._pw = sync_playwright().start()
         ws_url = self._resolve_ws_url()
         LOGGER.info("CDP 연결: %s (via ws=%s)", self.cdp_url, ws_url)
@@ -209,6 +119,8 @@ class KorailSPAClient(AbstractContextManager["KorailSPAClient"]):
         """Chrome 의 /json/version 에서 webSocketDebuggerUrl 을 직접 받는다."""
         import json
         import urllib.request
+        if self.cdp_url.startswith(("ws://", "wss://")):
+            return self.cdp_url
         try:
             # NOTE: Chrome 은 Host=127.0.0.1 거부 → URL 호스트는 'localhost' 로
             base = self.cdp_url.rstrip("/")
@@ -234,6 +146,7 @@ class KorailSPAClient(AbstractContextManager["KorailSPAClient"]):
         finally:
             self._browser = None
             self._context = None
+            self._main_page = None
         if self._pw:
             self._pw.stop()
             self._pw = None
@@ -247,6 +160,8 @@ class KorailSPAClient(AbstractContextManager["KorailSPAClient"]):
     def main_page(self) -> Page:
         """사용할 메인 page. 없으면 새로 만든다. popup guard 자동 부착."""
         ctx = self.context
+        if self._main_page is not None and not self._main_page.is_closed():
+            return self._main_page
         page: Optional[Page] = None
         # 가장 적합한 page = korail.com 또는 about:blank
         for p in ctx.pages:
@@ -259,7 +174,7 @@ class KorailSPAClient(AbstractContextManager["KorailSPAClient"]):
                 break
         if page is None:
             page = ctx.new_page()
-        _attach_popup_guard(page)
+        self._main_page = page
         return page
 
 
@@ -273,86 +188,49 @@ def safe_goto(page: Page, url: str, timeout_ms: int = 30_000) -> None:
         raise SiteLayoutChanged(f"goto timeout: {url}") from e
 
 
+def _click_visible(page: Page, selector: str, timeout: int = 2000) -> bool:
+    button = first_visible(page, selector)
+    if not button.is_visible():
+        return False
+    button.click(timeout=timeout)
+    return True
+
+
 def dismiss_macro_notice(page: Page) -> bool:
-    """메인 페이지의 -8002/-8003 ReactModal '확인' 클릭 dismiss."""
     try:
-        body_txt = page.locator("body").inner_text(timeout=1500)
+        state = read_page_state(page)
+        if not any(kw in state["body"] for kw in S.MACRO_NOTICE_KEYWORDS):
+            return False
+        clicked = _click_visible(page, S.MODAL_CONFIRM_BUTTON)
+        if clicked:
+            human_pause(0.8, 1.4)
+        return clicked
     except Exception:
         return False
-    if not any(kw in body_txt for kw in S.MACRO_NOTICE_KEYWORDS):
-        return False
-    # visible 한 '확인' 버튼 클릭
-    btns = page.locator(S.MODAL_CONFIRM_BUTTON)
-    n = btns.count()
-    for i in range(n):
-        b = btns.nth(i)
-        try:
-            if b.is_visible():
-                b.click(timeout=2000)
-                LOGGER.info("매크로 안내 모달 '확인' 클릭 dismiss")
-                time.sleep(random.uniform(0.8, 1.4))
-                return True
-        except Exception:
-            continue
-    return False
 
 
 def dismiss_notice_modal(page: Page) -> bool:
     try:
-        body_txt = page.locator("body").inner_text(timeout=1500)
+        state = read_page_state(page)
+        if not any(kw in state["body"] for kw in S.NOTICE_MODAL_KEYWORDS):
+            return False
+        _click_visible(page, S.NOTICE_MODAL_HIDE_TODAY_CHECKBOX, timeout=1500)
+        clicked = _click_visible(page, S.NOTICE_MODAL_DISMISS_BUTTON)
+        if clicked:
+            human_pause(0.6, 1.0)
+        return clicked
     except Exception:
         return False
-    if not any(kw in body_txt for kw in S.NOTICE_MODAL_KEYWORDS):
-        return False
-    # 1) "N일간 그만보기" 체크박스 있으면 먼저 체크 — 닫으면 cookie 로 24시간 안 뜸.
-    try:
-        chks = page.locator(S.NOTICE_MODAL_HIDE_TODAY_CHECKBOX)
-        for i in range(chks.count()):
-            c = chks.nth(i)
-            try:
-                if c.is_visible():
-                    c.click(timeout=1500)
-                    LOGGER.info("공지 모달 '그만보기' 체크")
-                    time.sleep(0.2)
-                    break
-            except Exception:
-                continue
-    except Exception:
-        pass
-    # 2) 닫기 버튼 클릭
-    btns = page.locator(S.NOTICE_MODAL_DISMISS_BUTTON)
-    try:
-        n = btns.count()
-    except Exception:
-        return False
-    for i in range(n):
-        b = btns.nth(i)
-        try:
-            if b.is_visible():
-                b.click(timeout=2000)
-                LOGGER.info("공지 모달 '창닫기' 클릭 dismiss")
-                time.sleep(random.uniform(0.6, 1.0))
-                return True
-        except Exception:
-            continue
-    return False
 
 
 def dismiss_any_modal(page: Page) -> bool:
-    """일반적인 안내 모달의 visible '확인' 버튼 클릭. 매크로 키워드 검사 없음."""
-    btns = page.locator(S.MODAL_CONFIRM_BUTTON)
-    n = btns.count()
-    for i in range(n):
-        b = btns.nth(i)
-        try:
-            if b.is_visible():
-                b.click(timeout=2000)
-                LOGGER.info("안내 모달 '확인' 클릭 dismiss")
-                time.sleep(random.uniform(0.6, 1.2))
-                return True
-        except Exception:
-            continue
-    return False
+    try:
+        clicked = _click_visible(page, S.MODAL_CONFIRM_BUTTON)
+        if clicked:
+            human_pause(0.6, 1.2)
+        return clicked
+    except Exception:
+        return False
 
 
 _INFO_KEYWORDS = S.MACRO_NOTICE_KEYWORDS + (
@@ -376,16 +254,11 @@ def _click_proceed_if_asked(pg: Page, txt: str) -> bool:
     if not any(kw in txt for kw in _PROCEED_KEYWORDS):
         return False
     try:
-        btns = pg.locator(S.MODAL_PROCEED_BUTTON)
-        for i in range(btns.count()):
-            b = btns.nth(i)
-            if b.is_visible():
-                b.click(timeout=2000)
-                LOGGER.info("진행 확인 모달 '네' 클릭 (modal=%r)", txt[:150])
-                time.sleep(random.uniform(0.5, 0.9))
-                return True
+        if _click_visible(pg, S.MODAL_PROCEED_BUTTON):
+            human_pause(0.5, 0.9)
+            return True
     except Exception as e:
-        LOGGER.debug("진행 확인 '네' 클릭 실패: %s", e)
+        LOGGER.debug("Proceed confirmation failed: %s", e)
     return False
 
 
@@ -407,52 +280,25 @@ def dismiss_all_popups(context) -> int:
         except Exception:
             continue
 
-        # popup body 텍스트 확인
         try:
-            body = pg.locator("body").inner_text(timeout=1000)
+            state = read_page_state(pg)
         except Exception:
             continue
-
-        is_info = any(kw in body for kw in _INFO_KEYWORDS)
-        if not is_info:
+        body = state["body"]
+        if not any(kw in body for kw in _INFO_KEYWORDS):
             continue
+        modal_txt = next(iter(state["modals"]), "")
 
-        # dismiss 전에 모달 자체 텍스트 확보 — 예매 불발 원인 진단용 (body 는 페이지 머리글이라 무의미)
-        modal_txt = ""
-        for _sel in (".ReactModal__Content", "[role=dialog]"):
-            try:
-                _m = pg.locator(_sel).first
-                if _m.count() > 0 and _m.is_visible():
-                    modal_txt = _m.inner_text(timeout=500)
-                    break
-            except Exception:
-                continue
-
-        # 진행 확인형 모달 (아니오/네) 이면 '네' 클릭으로 예약 흐름 계속
         if _click_proceed_if_asked(pg, modal_txt or body):
             count += 1
             continue
 
-        # in-page ReactModal 인지 popup window 인지 무관 — visible 한 '확인' 버튼만 찾아 클릭
         try:
-            btns = pg.locator(S.MODAL_CONFIRM_BUTTON)
-            n = btns.count()
+            if _click_visible(pg, S.MODAL_CONFIRM_BUTTON):
+                count += 1
+                human_pause(0.5, 0.9)
         except Exception:
             continue
-        for i in range(n):
-            b = btns.nth(i)
-            try:
-                if b.is_visible():
-                    b.click(timeout=2000)
-                    LOGGER.info(
-                        "popup/모달 '확인' dismiss (url=%s, modal=%r)",
-                        pg.url, (modal_txt or body)[:200],
-                    )
-                    count += 1
-                    time.sleep(random.uniform(0.5, 0.9))
-                    break
-            except Exception:
-                continue
     return count
 
 
@@ -465,12 +311,15 @@ def attach_context_popup_guard(context) -> None:
         return
 
     def _on_page(new_page: Page) -> None:
+        # A tab created by the client is not an advertising popup.
+        if new_page.opener() is None:
+            return
         try:
             new_page.wait_for_load_state("domcontentloaded", timeout=3000)
         except Exception:
             pass
         try:
-            body = new_page.locator("body").inner_text(timeout=2000)
+            body = read_page_state(new_page)["body"]
         except Exception:
             body = ""
         if not any(kw in body for kw in _INFO_KEYWORDS):
@@ -489,10 +338,7 @@ def attach_context_popup_guard(context) -> None:
             return
         try:
             time.sleep(random.uniform(0.5, 1.0))
-            btn = new_page.locator(S.MODAL_CONFIRM_BUTTON).first
-            if btn.count() > 0 and btn.is_visible():
-                btn.click(timeout=3000)
-                LOGGER.info("popup '확인' 클릭 완료")
+            _click_visible(new_page, S.MODAL_CONFIRM_BUTTON, timeout=3000)
         except Exception as e:
             LOGGER.debug("popup 확인 클릭 실패: %s", e)
 
@@ -507,7 +353,6 @@ __all__ = [
     "safe_goto",
     "dismiss_macro_notice",
     "human_pause",
-    "human_mouse",
     "human_click",
     "human_type",
     "HUMANIZE",

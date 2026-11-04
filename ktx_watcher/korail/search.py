@@ -22,9 +22,10 @@ import time as _time
 from datetime import date as _date, time as Time
 from typing import Any, Dict, List, Optional
 
-from playwright.sync_api import Page, TimeoutError as PWTimeoutError
+from ..browser import Page, TimeoutError as PWTimeoutError
 
 from ..config import KTXAConfig
+from ..dom import read_page_state
 from . import CaptchaDetected, GuardBlocked, SiteLayoutChanged
 from . import selectors as S
 from .client import (
@@ -32,7 +33,6 @@ from .client import (
     dismiss_macro_notice,
     dismiss_notice_modal,
     human_click,
-    human_mouse,
     human_pause,
     human_type,
     safe_goto,
@@ -45,9 +45,11 @@ _TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
 # ── 응답끼리 비교하기 위한 기준선 ────────────────────────────────────────
 # 워처는 어차피 같은 질의를 반복한다. 따로 저장소를 두지 않고, **이번 실행에서
 # 받은 응답들** 중 최대 row 수를 들고 있다가 갑자기 쪼그라들면 의심한다.
-# (2026-11-03: 코레일은 '목록을 통째로 비우는' 형태로 거짓 응답을 보낸다 —
-#  6/6 동일하게 0편. 다만 '목록은 주되 일부만 주는' 형태로 바뀔 수 있어
-#  사용자 지적(대한항공 유사 사례)에 따라 축소도 함께 본다.)
+# (2026-11-03: 6/6 동일하게 0편 — 당시엔 '목록을 통째로 비우는 거짓 응답' 으로
+#  봤으나, 2026-11-04 실측으로 첫 제출에만 걸리는 1회성 -8002 가드를 코드가
+#  닫고 바로 포기한 결과였음이 확인됨 (_requery_after_guard 참조). 다만 '목록은
+#  주되 일부만 주는' 형태는 여전히 가능해 사용자 지적(대한항공 유사 사례)에 따라
+#  축소도 함께 본다.)
 # 프로세스 메모리에만 둔다 — 재시작하면 초기화되고, 그래도 0건 규칙이 남는다.
 _ROW_BASELINE: Dict[str, int] = {}
 
@@ -70,7 +72,6 @@ def _select_station(page: Page, slot: str, station: str) -> None:
 
     open_sel = S.ORIGIN_BTN if slot == "origin" else S.DEST_BTN
     LOGGER.info("역 선택: slot=%s name=%s", slot, station)
-    human_mouse(page, moves=2)
     human_click(page.locator(open_sel).first)
 
     try:
@@ -462,25 +463,21 @@ def _set_passengers(page: Page, config: KTXAConfig) -> None:
 
 # ─────────────────── 결과 처리 ───────────────────
 
-def _click_train_type_tab(page: Page, train_type: str) -> None:
+def _click_train_type_tab(page: Page, train_type: str) -> bool:
     if not train_type or train_type in ("전체", "ALL"):
-        return
+        return False
     sel = S.TRAIN_TYPE_TAB.get(train_type)
     if not sel:
         LOGGER.warning("열차종류 '%s' 미지원", train_type)
-        return
-    loc = page.locator(sel).first
-    if loc.count() == 0:
-        LOGGER.warning("열차종류 탭 '%s' DOM 미발견", train_type)
-        return
+        return False
     try:
-        cls = (loc.get_attribute("class", timeout=500) or "").lower()
-        aria = (loc.get_attribute("aria-selected", timeout=500) or "").lower()
-        if "active" in cls or "current" in cls or aria == "true":
-            LOGGER.info("열차종류 탭 '%s' 이미 active", train_type)
-            return
-    except Exception:
-        pass
+        state = read_page_state(page, tab=sel, include_text=False)["tab"]
+    except Exception as e:
+        LOGGER.debug("Train tab state unavailable: %s", e)
+        return False
+    if state is None or state["active"]:
+        return False
+    loc = page.locator(sel).first
     # 클릭 전 modal dismiss (delayed -8002 우회)
     for attempt in range(3):
         dismiss_macro_notice(page)
@@ -488,10 +485,11 @@ def _click_train_type_tab(page: Page, train_type: str) -> None:
             loc.click(timeout=4000)
             LOGGER.info("열차종류 탭 '%s' 클릭 (attempt=%d)", train_type, attempt + 1)
             human_pause(0.8, 1.4)
-            return
+            return True
         except Exception as e:
             LOGGER.warning("열차종류 탭 클릭 attempt=%d 실패: %s", attempt + 1, e)
             _time.sleep(0.8)
+    return False
 
 
 def _parse_depart_time(text: str) -> Optional[Time]:
@@ -667,13 +665,68 @@ def fill_search_form(page: Page, config: KTXAConfig) -> None:
     human_pause(0.8, 1.4)
 
 
+def _requery_after_guard(
+    page: Page,
+    *,
+    where: str,
+    attempts: int = 2,
+) -> List[Dict[str, Any]]:
+    """매크로 안내(-8002/-8003) 를 닫은 뒤 '조회' 를 다시 눌러 목록을 받는다.
+
+    이 가드는 **첫 조회 제출에만 걸리는 1회성** 이다 (2026-11-04 실측:
+    모달 dismiss 후 조회 재클릭 또는 reload 한 번이면 정상 목록 10건.
+    사용자 관찰 "refresh 누르면 잘 나온다" 와 일치).
+    dismiss 직후 바로 차단으로 단정하면 가드가 이미 풀린 뒤에도 영구 0건이 된다.
+
+    재조회에도 계속 빈 목록이면 진짜 차단이므로 GuardBlocked(explicit=True).
+    """
+    for i in range(1, attempts + 1):
+        LOGGER.warning("매크로 안내 감지 (%s) — 조회 재시도 %d/%d", where, i, attempts)
+        human_pause(1.0, 2.0)
+        try:
+            btn = page.locator(S.SEARCH_SUBMIT).first
+            if btn.count() == 0:
+                LOGGER.warning("조회 버튼(%s) 미발견 — 재시도 중단", S.SEARCH_SUBMIT)
+                break
+            human_click(btn)
+        except Exception as e:
+            LOGGER.warning("조회 재클릭 실패: %s — 재시도 중단", e)
+            break
+
+        try:
+            page.wait_for_load_state("networkidle", timeout=12_000)
+        except PWTimeoutError:
+            LOGGER.debug("재조회 networkidle timeout — 계속")
+        human_pause(1.5, 2.5)
+
+        if dismiss_macro_notice(page):
+            LOGGER.warning("재조회에도 매크로 안내 재등장 (%d/%d)", i, attempts)
+            continue
+
+        try:
+            raw = _parse_result_rows(page)
+        except Exception as e:
+            LOGGER.warning("재조회 후 row 파싱 race: %s", e)
+            raw = []
+        if raw:
+            LOGGER.info("재조회 OK — %d 행 (1회성 가드 해제 확인)", len(raw))
+            return raw
+        LOGGER.warning("재조회 결과도 0건 (%d/%d)", i, attempts)
+
+    raise GuardBlocked(
+        f"매크로 안내 모달(-8002/-8003) 감지 ({where}) — "
+        f"조회 재시도 {attempts}회에도 목록 0건",
+        explicit=True,
+    )
+
+
 def submit_search(page: Page) -> List[Dict[str, Any]]:
     """검색 제출 → 결과 페이지 → row 파싱.
 
-    매크로 안내(-8002/-8003) 가 뜨면 dismiss 후 빈 결과 return.
-    재검색은 호출자(main polling) 책임.
+    매크로 안내(-8002/-8003) 가 뜨면 dismiss 후 조회를 다시 눌러 받아온다
+    (가드는 첫 제출에만 걸리는 1회성 — _requery_after_guard).
+    재시도에도 0건이면 GuardBlocked 로 올린다.
     """
-    human_mouse(page, moves=4)
     # 검색 제출 직전 사람-유사 대기 (자동화 즉시 제출 패턴 회피)
     human_pause(3.0, 6.0)
     human_click(page.locator(S.SEARCH_SUBMIT).first)
@@ -696,12 +749,8 @@ def submit_search(page: Page) -> List[Dict[str, Any]]:
     human_pause(1.5, 2.5)
 
     # -8002 안내 모달 / 팝업 처리 (popup 핸들러는 자동으로 동작, 메인 모달은 여기서)
-    dismissed = dismiss_macro_notice(page)
-    if dismissed:
-        raise GuardBlocked(
-            "매크로 안내 모달(-8002/-8003) 감지 — 조회 결과를 믿을 수 없음",
-            explicit=True,
-        )
+    if dismiss_macro_notice(page):
+        return _requery_after_guard(page, where="검색 제출")
 
     return _parse_result_rows(page)
 
@@ -742,12 +791,16 @@ def _expand_more_until(
         if last and (last.hour * 60 + last.minute) >= limit_min:
             break
         try:
-            btn = page.get_by_role("button", name="더보기").first
+            btn = page.locator(S.RESULT_MORE_BUTTON).first
             if btn.count() == 0 or not btn.is_visible():
+                LOGGER.warning(
+                    "'더보기' 미발견/비표시 — %02d:%02d 까지 확장 못 함 (마지막 행 %s)",
+                    limit_min // 60, limit_min % 60, last,
+                )
                 break
             human_click(btn)
         except Exception as e:
-            LOGGER.debug("더보기 확장 중단: %s", e)
+            LOGGER.warning("더보기 확장 중단: %s", e)
             break
         human_pause(0.8, 1.4)
         try:
@@ -787,24 +840,25 @@ def perform_search(
         except PWTimeoutError:
             LOGGER.debug("reload networkidle timeout — 계속")
         human_pause(1.5, 2.5)
-        dismissed = dismiss_macro_notice(page)
-        if dismissed:
-            raise GuardBlocked(
-                "매크로 안내 모달(-8002/-8003) 감지 (reload) — 조회 결과를 믿을 수 없음",
-                explicit=True,
-            )
+        guarded = dismiss_macro_notice(page)
         _ensure_srt_on_result(page, config)
-        try:
-            raw = _parse_result_rows(page)
-        except Exception as e:
-            LOGGER.warning("reload 후 row 파싱 race: %s — 빈 결과로 반환", e)
-            raw = []
+        if guarded:
+            raw = _requery_after_guard(page, where="reload")
+        else:
+            try:
+                raw = _parse_result_rows(page)
+            except Exception as e:
+                LOGGER.warning("reload 후 row 파싱 race: %s — 빈 결과로 반환", e)
+                raw = []
     else:
         page = navigate_to_search(client)
         # 폼 입력은 값이 다를 때만 (반복 자동화 시그널 회피).
         # navigate_to_search 가 /search/general 로 갈 때 SPA 가 이전 form 값 유지함.
-        if _input_value(page, S.ORIGIN_INPUT) != config.ktxa_origin.strip() \
-                or _input_value(page, S.DEST_INPUT) != config.ktxa_dest.strip():
+        form = read_page_state(page, inputs={
+            "origin": S.ORIGIN_INPUT, "dest": S.DEST_INPUT,
+        }, include_text=False)["inputs"]
+        if (form["origin"] or "").strip() != config.ktxa_origin.strip() \
+                or (form["dest"] or "").strip() != config.ktxa_dest.strip():
             fill_search_form(page, config)
         else:
             # 날짜만 따로 확인 (역은 같지만 날짜 다를 수 있음)
@@ -823,10 +877,12 @@ def perform_search(
 
         if raw:
             # KTX 만 필터링 (탭 클릭)
-            _click_train_type_tab(page, config.ktxa_train_type)
-            human_pause(0.8, 1.4)
+            changed = _click_train_type_tab(page, config.ktxa_train_type)
+            if changed:
+                human_pause(0.8, 1.4)
             try:
-                raw = _parse_result_rows(page)
+                if changed:
+                    raw = _parse_result_rows(page)
             except Exception as e:
                 LOGGER.warning("KTX 탭 후 row 파싱 race: %s", e)
                 raw = []
@@ -834,8 +890,10 @@ def perform_search(
     # 감시 대상 최댓 시각까지 '더보기' 확장 (첫 화면엔 일부 행만 로드됨)
     raw = _expand_more_until(page, config, raw)
 
-    # ── 조용한 차단 감지 (2026-11-03 실측) ──────────────────────────────
-    # CDP 세션이 붙으면 코레일이 모달 없이 열차 목록 자체를 비워 보낸다.
+    # ── 목록 0건 감지 (2026-11-03 실측, 2026-11-04 원인 정정) ──────────────
+    # 11-03 에 본 '모달 없이 빈 목록' 은 실은 1회성 -8002 모달을 dismiss 한 뒤
+    # 재조회 없이 파싱한 결과였다 (지금은 _requery_after_guard 가 재조회한다).
+    # 그래도 이 검사는 남긴다 — 재조회 후에도 0건이면 진짜 차단이거나 조회 조건 오류다.
     # '전부 매진' 과는 다르다 — 매진이면 row 는 나오고 status 만 '매진' 이다.
     # row 가 0 인데 no-data 마커가 떠 있으면 차단이거나 조회 조건이 잘못된 것.
     # 둘 다 "계속 폴링해도 의미 없음" 이므로 호출자에게 올린다.

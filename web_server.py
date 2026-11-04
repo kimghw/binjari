@@ -3336,7 +3336,7 @@ def _wlog(msg: str) -> None:
 def _cdp_ops(op: str) -> str:
     """워처의 CDP Chrome 에 대해 안전한 조작만 수행. 실패해도 예외 대신 문자열."""
     try:
-        from playwright.sync_api import sync_playwright
+        from ktx_watcher.browser import sync_playwright
         port = _read_env_values().get("KTXA_CDP_PORT", "9444")
         with sync_playwright() as p:
             browser = p.chromium.connect_over_cdp(f"http://localhost:{port}")
@@ -3346,12 +3346,11 @@ def _cdp_ops(op: str) -> str:
             if pg is None:
                 return "(브라우저에 페이지 없음)"
             if op == "snapshot":
-                out = [f"url: {pg.url}"]
-                for sel in (".ReactModal__Content", "[role=dialog]"):
-                    m = pg.locator(sel).first
-                    if m.count() > 0 and m.is_visible():
-                        out.append(f"모달: {m.inner_text(timeout=1500)[:300]}")
-                out.append("본문: " + pg.locator("body").inner_text(timeout=2000)[:600])
+                from ktx_watcher.dom import read_page_state
+                state = read_page_state(pg)
+                out = [f"url: {state['url']}"]
+                out.extend(f"모달: {text[:300]}" for text in state["modals"])
+                out.append("본문: " + state["body"][:600])
                 return "\n".join(out)
             if op == "dismiss_modals":
                 n = 0

@@ -17,7 +17,7 @@ Watcher / 자동화 스크립트가 클릭 또는 navigate 후 **예상한 결�
 루틴:
 
 ```python
-from playwright.sync_api import sync_playwright
+from ktx_watcher.browser import sync_playwright
 with sync_playwright() as p:
     browser = p.chromium.connect_over_cdp("http://localhost:<port>")
     pg = browser.contexts[0].pages[0]

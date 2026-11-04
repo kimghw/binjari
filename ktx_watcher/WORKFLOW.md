@@ -124,13 +124,23 @@
 
 | 증상 | 원인 | 해결 |
 |---|---|---|
-| 매 iteration 마다 -8002 | `_set_date` 가 매번 picker 열어 반복 클릭 패턴 → 봇 시그널 | 같은 값이면 picker skip (적용됨) |
+| 새 폼 제출에서 -8002 반복 | 보안 거절 응답 확인, 정확한 탐지 조건은 미확정. picker 생략 시에도 재현 | [CDP·UIA 비교 기록](QUERY_AUTOMATION_ANALYSIS_2026-11-04.md) 참고. 차단 증거와 조회 조건을 보존해 재확인 |
 | KTX 탭 클릭 timeout | selector 가 GNB "KTX 마일리지" 매칭 | `ul.tab_bar button:has(div.korail_logo_tab)` 로 정확 매칭 |
 | 결과 row 0 + no-data 마커 없음 | 파서 못 잡음 / 모달 가림 | dismiss_all_popups 호출 + 재검색 |
 | 시간 픽커 모달이 검색 결과 가림 | `delayed -8002 popup` 이 KTX 탭 가림 | KTX 탭 클릭 attempt loop (3회) + dismiss 매번 |
 | "해당 스케줄 운행 없음" 항상 표시 | 진짜 매진 + 매크로 silent block 모두 가능 | iteration 한번 더 (자연 polling) |
 
 ### 3-4. 후보 추출 / 필터
+
+`KTXA_TIME_WINDOW`가 설정되면 해당 구간 전체를 사용한다. 시간창이 비어 있을 때만
+`KTXA_TIMES` ± `KTXA_TOLERANCE_MIN`으로 후보를 제한한다. 폼 제출·재조회·결과 파싱 전후에
+날짜·구간·시각·인원을 검증한다. 예약할 때는 조회 당시의 정확한 행과 좌석을 다시 확인하며,
+매칭 실패 시 첫 번째 가용 좌석으로 대체하지 않는다.
+
+명시적 차단은 `GuardBlocked`, 조회 조건 불일치는 `QueryConditionMismatch`,
+빈 목록·불완전 목록은 `SearchResultUnavailable`로 구분한다.
+차단 화면·문구는 dismiss 전에 `runs/guards/`에 저장하며,
+`python -m ktx_watcher.diagnose`는 예약 없이 실제 조회 기록을 남긴다.
 
 | 증상 | 원인 | 해결 |
 |---|---|---|
@@ -180,8 +190,10 @@
 - `socket.getaddrinfo` monkey-patch — `localhost` 를 `127.0.0.1` (AF_INET) 로 고정.
 - 모듈 import 시점에 즉시 적용 — playwright import 보다 *먼저*.
 
-### C. picker skip = 봇 시그널 제거
-- 같은 검색을 반복해도 `_set_date` 가 picker 안 열면 -8002 안 뜸.
+### C. 같은 날짜의 재설정 생략
+
+- `_set_date`는 같은 값이면 picker를 생략한다. 2026-11-04 재검증에서는 이 상태에서도
+  `-8002`가 발생했으므로 차단 방지를 보장하지 않는다.
 - 매 액션을 *필요한 경우에만* 수행하는 게 핵심.
 
 ### D. 공통 popup 처리
@@ -251,6 +263,9 @@ python -m ktx_watcher_spa.main
 ---
 
 ## 7. 참고 문서
+
+- [2026-11-04 조회 자동화 분석](QUERY_AUTOMATION_ANALYSIS_2026-11-04.md) — CDP 개별 실행,
+  UIA 제출 비교, 확인 범위와 Claude Code 복구 현황
 
 - [PAGES.md](PAGES.md) — 페이지별 메뉴/액션 카탈로그 (DOM probe 결과)
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — 디버깅 여정에서 만난 16개 원인 상세

@@ -12,6 +12,7 @@ from typing import Dict, List
 from .chrome_launcher import ChromeLauncher
 from .config import ConfigError, KTXAConfig, load_config
 from .korail import CaptchaDetected, GuardBlocked, LoginError, ReservationFailed, SiteLayoutChanged, UserActionRequired
+from .korail import QueryConditionMismatch, SearchResultUnavailable
 from .korail import payment as payment_mod
 from .korail import reserve as reserve_mod
 from .korail import search as search_mod
@@ -372,6 +373,9 @@ def main() -> int:
                 except CaptchaDetected as e:
                     LOGGER.warning("Captcha: %s — backoff", e)
                     _sleep_with_jitter(5.0, 12.0)
+                except (QueryConditionMismatch, SearchResultUnavailable) as e:
+                    LOGGER.error("조회 검증 실패 (%s): %s — 차단으로 분류하지 않고 중단", type(e).__name__, e)
+                    return 1
                 except SiteLayoutChanged as e:
                     LOGGER.error("Site layout changed: %s", e)
                     return 1

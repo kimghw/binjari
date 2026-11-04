@@ -4,13 +4,17 @@ CDP 연결 / Chrome 환경 트러블은 [WORKFLOW.md §3-1](WORKFLOW.md#3-1-cdp-
 본 문서는 **Korail SPA 흐름 자체** (검색/예약/결제 selectors, popup, 매크로 가드)
 에서 만난 사이트 특성 이슈만 보관.
 
+2026-11-04 조회 차단 재검증과 CDP·UIA·Claude Code 현황은
+[최신 분석 기록](QUERY_AUTOMATION_ANALYSIS_2026-11-04.md)을 참고한다.
+
 ---
 
-## 1. _set_date 매번 picker 열면 매크로 가드 -8002 트리거 ✓
-- 증상: polling 매 iteration 마다 "안내 메시지 CODE: -8002" 모달 + 빈 결과.
-- 원인: 검색 페이지 재진입마다 `_set_date` 가 무조건 datepicker 열고 day/hour/apply
-  4번 클릭. 같은 값인데도 반복 클릭하는 패턴이 봇 시그널.
-- 해결: `input#startDate` 현재 값이 target 과 일치하면 picker skip.
+## 1. 날짜 선택기의 불필요한 조작 줄이기 — 차단 원인 단정 정정
+
+- 기존 개선: `input#startDate` 현재 값이 target과 일치하면 picker를 생략한다.
+- 2026-11-04 재검증: picker를 생략한 조회에서도 `-8002`가 발생했다.
+  반복 날짜 클릭을 이번 차단의 확정 원인으로 볼 수 없다.
+- 같은 값의 반복 조작을 줄이는 개선은 유지하되, 차단 여부는 실제 응답·안내로 판단한다.
 - 위치: `korail/search.py:_set_date`
 
 ## 2. KTX 탭 selector 가 GNB 'KTX 마일리지' 메뉴 매칭 ✓
@@ -59,11 +63,11 @@ CDP 연결 / Chrome 환경 트러블은 [WORKFLOW.md §3-1](WORKFLOW.md#3-1-cdp-
 - 해결: "원" 키워드 또는 명시적 예약 키워드 + "매진" (매진임박 제외) 으로 판정.
 - 위치: `korail/search.py:perform_search` 후보 필터 분기
 
-## 8. KTXA_ONCE=true + -8002 첫 검색 dismiss 충돌 ✓
-- 증상: 첫 검색에서 -8002 dismiss 후 빈 결과 → ONCE=true 라 종료. 두 번째 검색에서
-  결과 row 나오는데 못 봄.
-- 해결책 (선택): polling 모드 (`KTXA_ONCE=false`) 권장. ONCE 모드면 사전에 한 번
-  검색해둔 user-data-dir 권장.
+## 8. KTXA_ONCE=true와 차단 후 재조회
+
+- 과거 증상: 첫 차단 안내를 닫고 재조회하지 않아 빈 결과로 종료했다.
+- 현재는 검색 함수 안에서 조건을 검증하고 제한된 재조회를 수행한다. ONCE를 끄는 것만으로
+  해결된다고 안내하지 않는다. 차단 이후 복구 성공과 첫 제출 성공은 별도로 기록한다.
 
 ## 9. row anchor 매진 row 가 선택될 수 있음 (filter 한계) ⚠
 - 증상: `locator("a").filter(has_text="일반실").filter(has_text="원").filter(has_not_text="매진")`
@@ -90,19 +94,17 @@ CDP 연결 / Chrome 환경 트러블은 [WORKFLOW.md §3-1](WORKFLOW.md#3-1-cdp-
 - 위치: `korail/payment.py:_set_card_year`
 - 미확정: 실제 어느 케이스가 default 인지 추가 검증 필요.
 
-## 13. -8002 매크로 안내가 1회성인데 dismiss 직후 차단으로 포기 ✓
-- 증상: 조회마다 `GuardBlocked` + "운행하는 열차가 없습니다", 후보 0건. 사람이 같은
-  창에서 refresh/조회를 누르면 정상 목록이 나옴 (2026-11-04 실측).
-- 원인: -8002 모달은 **첫 조회 제출에만** 뜬다. `submit_search` 가 모달을 닫은 직후
-  재조회 없이 `GuardBlocked` 를 던져, 가드가 이미 풀린 뒤에도 영구 0건.
-  네트워크 추적: 목록 XHR 자체가 안 나가고 `schedule.runDt` 까지만 호출됨 → 빈 목록은
-  서버의 "열차 없음" 이 아니라 가드가 끊은 흔적. (11-03 의 '모달 없이 조용한 차단' 도
-  dismiss 가 먼저 돌고 파싱한 같은 현상이었다.)
-- 해결: `_requery_after_guard` — dismiss 후 `button.btn_lookup` 재클릭 → 재파싱,
-  2회 재시도에도 0건일 때만 `GuardBlocked(explicit=True)`. 검색 제출·reload 경로 모두.
-- 참고: 로그인 단계에서도 같은 모달이 뜰 수 있는데 `ensure_logged_in` 은
-  `dismiss_macro_notice` 를 먼저 돌려 에러 문구를 `err=''` 로 잃는다. 원인 추적 시
-  dismiss **전에** 모달을 캡쳐할 것 (키워드 '안내 메세지' 가 일반 에러 모달도 삼킨다).
+## 13. -8002 명시적 차단과 조건을 유지한 재조회 — 2026-11-04 정정
+
+- 보호 경로 `/web_s/...`로 요청이 전송됐고 HTTP 200 본문에
+  `FAIL / macro_err1 / dynaPathResultCode=-8002`가 반환됐다.
+- 같은 브라우저에서 새 폼 제출 시 반복됐다. “최초 1회성”, “목록 XHR 미전송” 설명은 철회한다.
+- `_requery_after_guard`는 조건을 검증하고 결과 조회 버튼이 보이면 클릭하며,
+  그렇지 않으면 현재 결과 페이지를 새로고침한다. 실험에서는 전체 새로고침 후 정상 목록을 받았다.
+- 명시적 차단은 `GuardBlocked`, 차단 문구 없는 빈 목록은 `SearchResultUnavailable`로 구분한다.
+  재시도 횟수 제한과 조회 조건 검증을 유지한다. 날짜를 다음날로 바꾸어 복구하지 않는다.
+- 안내를 닫기 전에 증거를 남긴다. CDP 개별 시험 성공과 UIA 제출 비교는
+  [분석 기록](QUERY_AUTOMATION_ANALYSIS_2026-11-04.md)에 정리했다.
 - 위치: `korail/search.py:_requery_after_guard`, `submit_search`, `perform_search`
 
 ## 14. '더보기' 가 button 이 아니라 anchor — 확장이 조용히 중단 ✓

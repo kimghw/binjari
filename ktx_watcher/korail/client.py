@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import re
 import time
 from contextlib import AbstractContextManager
 from typing import Optional
@@ -32,6 +33,7 @@ from ..browser import (
 )
 
 from ..dom import first_visible, read_page_state
+from ..diagnostics import record_guard
 from . import selectors as S
 
 LOGGER = logging.getLogger("ktx_watcher_spa.korail.client")
@@ -99,21 +101,29 @@ class KorailSPAClient(AbstractContextManager["KorailSPAClient"]):
         if self._browser is not None:
             return
         self._pw = sync_playwright().start()
-        ws_url = self._resolve_ws_url()
-        LOGGER.info("CDP 연결: %s (via ws=%s)", self.cdp_url, ws_url)
-        self._browser = self._pw.chromium.connect_over_cdp(ws_url or self.cdp_url)
-        contexts = self._browser.contexts
-        if contexts:
-            self._context = contexts[0]
-        else:
-            self._context = self._browser.new_context()
-        LOGGER.info(
-            "CDP 연결 OK (contexts=%d pages=%d)",
-            len(self._browser.contexts),
-            len(self._context.pages),
-        )
-        # context-level popup guard 부착 — 어디서 popup 이 생기든 자동 확인 클릭
-        attach_context_popup_guard(self._context)
+        try:
+            ws_url = self._resolve_ws_url()
+            LOGGER.info("CDP 연결: %s (via ws=%s)", self.cdp_url, ws_url)
+            self._browser = self._pw.chromium.connect_over_cdp(ws_url or self.cdp_url)
+            contexts = self._browser.contexts
+            if contexts:
+                self._context = contexts[0]
+            else:
+                self._context = self._browser.new_context()
+            LOGGER.info(
+                "CDP 연결 OK (contexts=%d pages=%d)",
+                len(self._browser.contexts),
+                len(self._context.pages),
+            )
+            # context-level popup guard 부착 — 어디서 popup 이 생기든 자동 확인 클릭
+            attach_context_popup_guard(self._context)
+        except Exception:
+            # __exit__ is not called when __enter__ fails.
+            try:
+                self.stop()
+            except Exception:
+                LOGGER.debug("Driver cleanup after startup failure failed", exc_info=True)
+            raise
 
     def _resolve_ws_url(self) -> Optional[str]:
         """Chrome 의 /json/version 에서 webSocketDebuggerUrl 을 직접 받는다."""
@@ -148,8 +158,10 @@ class KorailSPAClient(AbstractContextManager["KorailSPAClient"]):
             self._context = None
             self._main_page = None
         if self._pw:
-            self._pw.stop()
-            self._pw = None
+            try:
+                self._pw.stop()
+            finally:
+                self._pw = None
 
     @property
     def context(self) -> BrowserContext:
@@ -196,10 +208,37 @@ def _click_visible(page: Page, selector: str, timeout: int = 2000) -> bool:
     return True
 
 
-def dismiss_macro_notice(page: Page) -> bool:
+# Generic headings such as '안내 메시지' are also used for ordinary notices.
+_GUARD_KEYWORDS = ("-8002", "-8003", "미허가", "개발자도구", "비정상적인 접속")
+
+
+def _guard_notice_from_state(state: dict) -> Optional[dict[str, str]]:
+    for text in state["modals"] or [state["body"]]:
+        positions = [text.find(kw) for kw in _GUARD_KEYWORDS if kw in text]
+        if not positions:
+            continue
+        code = re.search(r"-800[23](?!\d)", text)
+        start = max(0, min(positions) - 100) if len(text) > 1200 else 0
+        return {
+            "message": text[start:start + 1200].strip(),
+            "code": code.group(0) if code else "",
+        }
+    return None
+
+
+def inspect_guard_notice(page: Page) -> Optional[dict[str, str]]:
+    """Read current guard evidence without clicking or hiding read failures.
+
+    Prefer visible dialogs; a standalone popup may contain the notice in body.
+    The bounded message is suitable for a diagnostic artifact, not a full DOM dump.
+    """
+    return _guard_notice_from_state(read_page_state(page))
+
+
+def dismiss_macro_notice(page: Page, *, notice: Optional[dict[str, str]] = None) -> bool:
+    """Return click success only; callers use inspect_guard_notice for detection."""
     try:
-        state = read_page_state(page)
-        if not any(kw in state["body"] for kw in S.MACRO_NOTICE_KEYWORDS):
+        if notice is None and inspect_guard_notice(page) is None:
             return False
         clicked = _click_visible(page, S.MODAL_CONFIRM_BUTTON)
         if clicked:
@@ -214,7 +253,15 @@ def dismiss_notice_modal(page: Page) -> bool:
         state = read_page_state(page)
         if not any(kw in state["body"] for kw in S.NOTICE_MODAL_KEYWORDS):
             return False
+    except Exception:
+        return False
+    # Hiding a notice for the day is optional; a failed checkbox must not
+    # prevent closing the overlay and leave the search form obstructed.
+    try:
         _click_visible(page, S.NOTICE_MODAL_HIDE_TODAY_CHECKBOX, timeout=1500)
+    except Exception:
+        LOGGER.debug("Notice hide-today checkbox unavailable; closing the notice")
+    try:
         clicked = _click_visible(page, S.NOTICE_MODAL_DISMISS_BUTTON)
         if clicked:
             human_pause(0.6, 1.0)
@@ -319,9 +366,19 @@ def attach_context_popup_guard(context) -> None:
         except Exception:
             pass
         try:
-            body = read_page_state(new_page)["body"]
+            state = read_page_state(new_page)
+            body = state["body"]
         except Exception:
+            state = {"body": "", "modals": []}
             body = ""
+        notice = _guard_notice_from_state(state)
+        if notice is not None:
+            # Keep detection independent of subsequent confirm click success.
+            pending = getattr(context, "_pending_guard_notices", [])
+            context._pending_guard_notices = (pending + [notice])[-20:]
+            event = record_guard(new_page, notice, "popup")
+            events = getattr(context, "_guard_events", [])
+            context._guard_events = (events + [event])[-20:]
         if not any(kw in body for kw in _INFO_KEYWORDS):
             # 광고/외부 popup — close
             try:
@@ -352,6 +409,7 @@ __all__ = [
     "_attach_popup_guard",
     "safe_goto",
     "dismiss_macro_notice",
+    "inspect_guard_notice",
     "human_pause",
     "human_click",
     "human_type",

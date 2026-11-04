@@ -12,12 +12,14 @@ scope: 결제 *직전* 단계까지만. 실제 결제(카드 결제) 자동화�
 from __future__ import annotations
 
 import logging
+import re
 import time as _time
 from typing import Any, Dict
 
 from ..browser import Page, TimeoutError as PWTimeoutError
 
 from ..config import KTXAConfig
+from ..dom import read_page_state
 from . import CaptchaDetected, LoginError, ReservationFailed, SiteLayoutChanged, UserActionRequired
 from . import selectors as S
 from .client import (
@@ -139,6 +141,88 @@ def ensure_logged_in(
     LOGGER.info("로그인 성공 (url=%s)", page.url)
 
 
+def _select_reservation_anchor(page: Page, target: Dict[str, Any]):
+    """Resolve one unchanged search row and one seat-class action, or stop.
+
+    Row numbers can shift after a refresh, and a departure string can also be
+    another train's arrival time. Keep the complete row identity from the search
+    snapshot and check its first time separately. A stale snapshot requires a
+    fresh search; selecting another available train is never a fallback.
+    """
+    state = read_page_state(page, inputs={
+        "origin": S.ORIGIN_INPUT, "dest": S.DEST_INPUT, "date": S.DATE_INPUT,
+    }, include_text=False)
+    fields = state["inputs"]
+    if "/ticket/search/list" not in state["url"]:
+        raise ReservationFailed("예약 대상 검색 결과 페이지가 아닙니다")
+    for key in ("origin", "dest"):
+        expected = target.get(f"_query_{key}", target.get(key))
+        if not expected or (fields.get(key) or "").strip() != expected.strip():
+            raise ReservationFailed(f"예약 직전 조회 {key} 불일치 — 다시 조회해야 합니다")
+    page_date = re.match(r"\d{4}-\d{2}-\d{2}", fields.get("date") or "")
+    if not page_date or page_date.group() != target.get("date"):
+        raise ReservationFailed("예약 직전 조회 날짜 불일치 — 다시 조회해야 합니다")
+
+    raw = target.get("_raw") or ""
+    departure = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)", raw)
+    if not departure or f"{int(departure[1]):02d}:{departure[2]}" != target.get("depart"):
+        raise ReservationFailed("예약 대상 출발시각을 확인할 수 없습니다")
+    identity = "".join(raw.split())
+    if not identity:
+        raise ReservationFailed("예약 대상 열차 정보가 없습니다")
+
+    # A text-based locator re-resolves the same row even if row positions move.
+    identity_pattern = re.compile(r"^\s*" + r"\s*".join(map(re.escape, identity)) + r"\s*$")
+    row = page.locator("li.tckList").filter(has_text=identity_pattern)
+    matches = row.count()
+    if matches != 1:
+        raise ReservationFailed(f"예약 대상 열차 일치 행 {matches}개 — 다시 조회해야 합니다")
+
+    if "row_origin" in target or "row_dest" in target:
+        stations = row.locator(".data_box h3 > span").evaluate_all(
+            "els => els.slice(0, 2).map(el => (el.textContent || '').trim())"
+        )
+        expected_stations = [target.get("row_origin"), target.get("row_dest")]
+        if (not all(expected_stations) or stations != expected_stations
+                or stations != [target.get("origin"), target.get("dest")]):
+            raise ReservationFailed("예약 직전 열차의 실제 출발역·도착역 불일치")
+
+    seat_class = target.get("seat_class")
+    if seat_class not in ("일반실", "특실"):
+        raise ReservationFailed(f"지원하지 않는 예약 좌석 등급: {seat_class!r}")
+    boxes = row.locator(".price_box")
+    classes = boxes.evaluate_all("els => els.map(el => el.className)")
+    general_indices = [i for i, cls in enumerate(classes) if "gen" in cls.split()]
+    if not classes or len(general_indices) > 1:
+        raise SiteLayoutChanged("예약 대상 좌석 등급 구성을 확인할 수 없습니다")
+    general_index = general_indices[0] if general_indices else 0
+    if seat_class == "일반실":
+        box_index = general_index
+    else:
+        special_indices = [i for i in range(len(classes)) if i != general_index]
+        if len(special_indices) != 1:
+            raise SiteLayoutChanged("예약 대상 특실을 한 곳으로 특정할 수 없습니다")
+        box_index = special_indices[0]
+    box = boxes.nth(box_index)
+    kind = (target.get("status_kind") or "reserve").lower()
+    if kind == "waitlist":
+        anchor = box.locator("a").filter(has_text="예약대기")
+    elif kind == "standing":
+        anchor = box.locator("a").filter(has_text="입석")
+    elif kind == "reserve":
+        if "sold_out" in classes[box_index].split():
+            raise ReservationFailed("예약 대상 좌석이 매진되었습니다")
+        anchor = box.locator("a").filter(has_text="원").filter(
+            has_not_text=re.compile(r"매진(?!임박)"),
+        )
+    else:
+        raise ReservationFailed(f"지원하지 않는 예약 동작: {kind!r}")
+    anchor = anchor.filter(visible=True)
+    if anchor.count() != 1:
+        raise ReservationFailed("예약 대상 좌석 버튼을 한 곳으로 특정할 수 없습니다")
+    return anchor
+
+
 def attempt_reservation(
     client: KorailSPAClient,
     config: KTXAConfig,
@@ -155,59 +239,16 @@ def attempt_reservation(
         target["depart"], target["seat_class"],
     )
 
-    is_first = "특실" in (target.get("seat_class") or "")
-    seat_key = "특실" if is_first else "일반실"
-    depart_str = target.get("depart", "")  # 'HH:MM'
     status_kind = (target.get("status_kind") or "reserve").lower()
     LOGGER.info("status_kind=%s — 예매/예약대기/입석 분기", status_kind)
 
-    # ─── STEP 1: 결과 row 의 anchor 클릭 → row 선택 (파란 하이라이트) ───
-    # status_kind 별 anchor text 다름:
-    #   reserve  : "일반실23,700원5%적립"  (예약 가능 row 만 "일반실" 텍스트 있음)
-    #   waitlist : "예약대기"               (매진된 row 는 priceBox text 가 짧음 — "일반실" 단어 없음)
-    #   standing : "입석 + 좌석"            (동일)
-    import re as _re
-    if status_kind == "waitlist":
-        loc = page.locator("a").filter(has_text="예약대기")
-    elif status_kind == "standing":
-        loc = page.locator("a").filter(has_text="입석")
-    else:
-        loc = (
-            page.locator("a")
-            .filter(has_text=seat_key)
-            .filter(has_text="원")
-            .filter(has_not_text=_re.compile(r"매진(?!임)"))
-        )
-    n = loc.count()
-    chosen = None
-    for i in range(n):
-        a = loc.nth(i)
-        try:
-            parent_text = a.evaluate(
-                """el => {
-                    let p = el;
-                    for (let d = 0; d < 6 && p; d++) {
-                        if (p.textContent && /\\d{1,2}:\\d{2}/.test(p.textContent)) {
-                            return p.textContent;
-                        }
-                        p = p.parentElement;
-                    }
-                    return '';
-                }"""
-            ) or ""
-            if depart_str and depart_str in parent_text:
-                chosen = a
-                LOGGER.info("예약 row 선택: snippet=%r", parent_text[:120])
-                break
-        except Exception:
-            continue
-
-    if chosen is None and n > 0:
-        chosen = loc.first
-        LOGGER.warning("depart 매칭 실패 → 첫 번째 가용 anchor 사용")
-
-    if chosen is None:
-        raise SiteLayoutChanged("예약 가능한 가격 anchor 미발견")
+    # Validate the target again immediately before selecting its seat.
+    if (target.get("_query_origin", target.get("origin")),
+        target.get("_query_dest", target.get("dest")), target.get("date")) != (
+        config.ktxa_origin, config.ktxa_dest, config.ktxa_date.isoformat(),
+    ):
+        raise ReservationFailed("예약 대상과 현재 감시 조건이 다릅니다")
+    chosen = _select_reservation_anchor(page, target)
 
     try:
         human_click(chosen)

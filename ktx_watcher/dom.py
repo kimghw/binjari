@@ -8,9 +8,10 @@ from .browser import Page
 
 
 def read_page_state(page: Page, *, inputs: dict[str, str] | None = None,
-                    tab: str | None = None, include_text: bool = True) -> dict:
+                    tab: str | None = None, include_text: bool = True,
+                    texts: dict[str, str] | None = None) -> dict:
     return page.evaluate(
-        """({inputs, tab, includeText}) => {
+        """({inputs, tab, includeText, texts}) => {
             const visible = el => {
                 const style = getComputedStyle(el);
                 return style.visibility !== 'hidden' &&
@@ -25,13 +26,15 @@ def read_page_state(page: Page, *, inputs: dict[str, str] | None = None,
                 modals: modals.map(el => el.innerText || ''),
                 inputs: Object.fromEntries(Object.entries(inputs).map(
                     ([key, sel]) => [key, document.querySelector(sel)?.value ?? null])),
+                texts: Object.fromEntries(Object.entries(texts).map(
+                    ([key, sel]) => [key, document.querySelector(sel)?.textContent?.trim() ?? null])),
                 tab: activeTab ? {
                     active: /active|current/i.test(activeTab.className) ||
                         activeTab.getAttribute('aria-selected') === 'true'
                 } : null
             };
         }""",
-        {"inputs": inputs or {}, "tab": tab, "includeText": include_text},
+        {"inputs": inputs or {}, "tab": tab, "includeText": include_text, "texts": texts or {}},
     )
 
 

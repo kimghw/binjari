@@ -39,6 +39,19 @@
   동일 클라이언트의 연결과 메인 탭을 재사용하고, 탭 전환이 없으면 결과 재파싱을 생략합니다.
   Playwright가 사용하는 CDP 연결과 내부 프로토콜 명령은 계속 필요합니다.
   검증: `uv run pytest tests/test_browser_runtime.py -q -s`.
+- `KTXA_TIME_WINDOW`가 있으면 그 구간 전체를 감시합니다. 비어 있을 때만
+  `KTXA_TIMES` ± `KTXA_TOLERANCE_MIN`을 적용합니다.
+- 실제 조회 점검: `uv run python -m ktx_watcher.diagnose`.
+  로그인·예약·결제 없이 조회하고 `runs/diagnose/`에 조건, 목록, 후보, 오류 유형과
+  화면을 저장합니다. 명시적인 차단 안내는 닫기 전에 `runs/guards/`에 따로 기록합니다.
+  `GuardBlocked`는 차단 문구가 확인된 경우이고, `QueryConditionMismatch`는 조건 불일치,
+  `SearchResultUnavailable`는 빈 목록·불완전한 목록입니다. 정상 조회 후 후보 0건은
+  매진 또는 시간·구간·좌석 조건에 해당하는 열차가 없다는 뜻입니다.
+  전체 회귀 테스트: `uv run python -m pytest tests -q`.
+- 조회 차단과 실행 방식 비교:
+  [2026-11-04 CDP·UIA 분석 및 Claude Code 복구 현황](ktx_watcher/QUERY_AUTOMATION_ANALYSIS_2026-11-04.md).
+  CDP 개별 시험은 성공했으며, 전체 단계별 자동화의 반복 안정성은 아직 미검증입니다.
+  UIA Invoke는 진단 실험에만 적용돼 있고 운영 조회는 현재 CDP를 사용합니다.
 
 - `.env.ktx.example` 을 `.env.ktx` 로 복사해 `<...>` 자리에 실값(로그인·카드·Azure)을 채웁니다.
   **실값 파일은 커밋 금지** — `.gitignore` 가 `.env.*` 전체를 차단하며 양식(`*.example`)만 커밋됩니다.

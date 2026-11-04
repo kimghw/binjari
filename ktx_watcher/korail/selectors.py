@@ -11,13 +11,16 @@ LOGIN_URL = "https://www.korail.com/ticket/login"
 MAIN_URL = "https://www.korail.com/ticket/main"
 
 # ─────────────────── 검색 폼 (search/general) ───────────────────
-ORIGIN_INPUT = "input[name='txtGoStart']"
-DEST_INPUT = "input[name='txtGoEnd']"
+ORIGIN_INPUT = "input[name='txtGoStart'], input#labelstart"
+DEST_INPUT = "input[name='txtGoEnd'], input#labelend"
 ORIGIN_BTN = ".selectAreaWrap .start a.btn_pop-open"
 DEST_BTN = ".selectAreaWrap .end a.btn_pop-open"
 DATE_INPUT = "input#startDate"
 DATE_PICKER_BTN = "a.btn_pop.btn_d-day"
 SEARCH_SUBMIT = "button.btn_lookup"
+# Result-page controls differ from the search form (verified 2026-11-04).
+RESULT_SEARCH_SUBMIT = ".selectAreaWrap button.btn_bn-blue"
+RESULT_PEOPLE_INPUT = "input#labelple"
 SEARCH_FORM_DETECT = "button.btn_lookup, input[name='txtGoStart']"
 # SRT 포함 옵션 — VERIFIED 2026-11-03 (CDP DOM probe)
 #   사이트에서 "에스알티(SRT) 함께 보기"(srtCheckYn) 가 사라지고 SRT 가 KTX 탭에 통합됨.
@@ -37,7 +40,7 @@ SRT_RESULT_CHECKBOX_LABEL = "label[for='adjStnScdlOfrFlg2']"
 #   <li><p>경로(65세 이상)</p><div class="flo_right">
 #     <button class="down_num" [disabled]>...<span>0</span><button class="up_num">
 #   하단 <button class="btn_bn-blue">적용</button> / <button class="btn_pop-close">취소</button>
-PEOPLE_BTN = "a.data.btn_pop"
+PEOPLE_BTN = "a.data.btn_pop, .selectAreaWrap a.btn_recom"
 PEOPLE_POPUP = ".layerWrap.personnel_pop_wrap"
 PEOPLE_POPUP_APPLY = ".layerWrap.personnel_pop_wrap .btnWrap button.btn_bn-blue"
 PEOPLE_POPUP_CANCEL = ".layerWrap.personnel_pop_wrap .btnWrap button.btn_pop-close"

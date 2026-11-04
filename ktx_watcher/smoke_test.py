@@ -10,7 +10,8 @@ import sys
 
 from .chrome_launcher import ChromeLauncher
 from .config import ConfigError, load_config
-from .korail import CaptchaDetected, GuardBlocked, LoginError, SiteLayoutChanged
+from .korail import (CaptchaDetected, GuardBlocked, LoginError, SiteLayoutChanged,
+                    QueryConditionMismatch, SearchResultUnavailable)
 from .korail.client import KorailSPAClient
 from .korail.reserve import ensure_logged_in
 from .korail.search import perform_search
@@ -78,6 +79,9 @@ def main() -> int:
     except CaptchaDetected as e:
         err = ("CaptchaDetected", str(e))
         log.warning("Captcha: %s", e)
+    except (QueryConditionMismatch, SearchResultUnavailable) as e:
+        err = (type(e).__name__, str(e))
+        log.error("조회 검증 실패 (차단 미확정): %s", e)
     except SiteLayoutChanged as e:
         err = ("SiteLayoutChanged", str(e))
         log.warning("Layout: %s", e)
@@ -100,7 +104,7 @@ def main() -> int:
         print(f"[smoke_test] error: {err[0]}: {err[1]}")
         return 1
     if not candidates:
-        print("[smoke_test] WARNING: 0 candidates. -8002 dismiss 됐을 수 있음. main 모드로 polling 권장.")
+        print("[smoke_test] 조회 성공, 조건에 맞는 예약 후보 없음 (매진/시간/좌석 조건 확인).")
         return 0
     return 0
 

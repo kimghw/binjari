@@ -25,21 +25,16 @@ class ReservationFailed(KorailError):
     """예매 클릭 후 예약이 실제로 성립하지 않음 (잔여석 소진 등) — 다음 iteration 재시도."""
 
 
+class QueryConditionMismatch(KorailError):
+    """화면의 실제 조회 조건이 요청과 다르거나 확인되지 않음."""
+
+
+class SearchResultUnavailable(KorailError):
+    """열차 목록이 비어 있거나 불완전함. 차단으로 확정하지 않는다."""
+
+
 class GuardBlocked(KorailError):
-    """조회가 차단된 것으로 보임 — 결과를 '매진'으로 오인하면 안 되는 상태.
-
-    두 가지 형태 (2026-11-03 실측, 2026-11-04 보강):
-      explicit=True  : -8002/-8003 안내 모달. "매크로, 개발자도구 등 미허가 도구" 문구.
-                       첫 조회 제출에만 걸리는 1회성 가드라 search 가 먼저 재조회하고,
-                       재시도 후에도 0건일 때만 이 형태로 올린다.
-      explicit=False : 모달 없이 빈 목록. 열차가 실재하는데도
-                       '해당 스케줄에 운행하는 열차가 없습니다' 만 돌아온다.
-                       (11-03 에 본 사례는 dismiss 된 -8002 였음 — 재조회 도입 후
-                       이 형태가 실제로 재현되는지는 미확인.)
-
-    중요 — '열차 row 는 나오는데 전부 매진' 은 차단이 아니다(정상 감시 상태).
-    차단은 **열차 목록 자체가 사라지는** 것으로 구분한다.
-    """
+    """명시적인 차단 안내를 확인함. 빈 목록만으로 이 예외를 만들지 않는다."""
 
     def __init__(self, message: str, *, explicit: bool) -> None:
         super().__init__(message)
@@ -54,4 +49,6 @@ __all__ = [
     "UserActionRequired",
     "ReservationFailed",
     "GuardBlocked",
+    "QueryConditionMismatch",
+    "SearchResultUnavailable",
 ]

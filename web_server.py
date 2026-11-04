@@ -262,7 +262,7 @@ def _live_fetch(config: KTXAConfig) -> List[Dict[str, Any]]:
         page = ktx_search.navigate_to_search(client)
         ktx_search.fill_search_form(page, config)
         ktx_search._set_srt_option(page, config)
-        raw = ktx_search.submit_search(page)
+        raw = ktx_search.submit_search(page, config)
         # 사이트가 방금 채운 조건인데도 '운행하는 열차가 없습니다' 를 내는 일시 상태가
         # 있다 (2026-08-18 CDP 캡쳐로 확인, 새로고침 시 정상). 최대 2회 재시도.
         for attempt in range(2):
@@ -275,25 +275,15 @@ def _live_fetch(config: KTXAConfig) -> List[Dict[str, Any]]:
             except Exception:
                 pass
             page.wait_for_timeout(1_500)
-            raw = ktx_search._parse_result_rows(page)
-        # 사이트는 첫 화면에 일부만 주고 '더보기' 로 이어 붙인다.
-        # 하루 전체를 캐시하기 위해 더보기를 끝까지 펼친 뒤 다시 파싱.
-        expanded = False
-        for _ in range(20):
-            btn = page.get_by_role("button", name="더보기").first
-            if btn.count() == 0 or not btn.is_visible():
-                btn = page.get_by_text("더보기", exact=True).first
-                if btn.count() == 0 or not btn.is_visible():
-                    break
-            try:
-                btn.click(timeout=3_000)
-            except Exception as e:
-                LOGGER.debug("더보기 클릭 중단: %s", e)
-                break
-            expanded = True
-            page.wait_for_timeout(1_200)
-        if expanded:
-            raw = ktx_search._parse_result_rows(page)
+            if ktx_search._check_guard(page, "web/reload"):
+                raw = ktx_search._requery_after_guard(page, config=config, where="web/reload")
+            else:
+                ktx_search.validate_query(page, config, "web/reload")
+                raw = ktx_search._read_rows(page)
+        from datetime import time as clock_time
+        whole_day = config.model_copy(update={"ktxa_time_window": (clock_time(0), clock_time(23, 59))})
+        raw = ktx_search._expand_more_until(page, whole_day, raw)
+        ktx_search.validate_query(page, config, "web/pagination")
     return _shape_rows(raw)
 
 

@@ -258,7 +258,7 @@ def main() -> int:
             try:
                 from .korail.search import fill_search_form, submit_search, _click_train_type_tab
                 fill_search_form(page, config)
-                submit_search(page)
+                submit_search(page, config)
                 # 두 번째 검색으로 결과 row 보이게
                 safe_goto(page, S.SEARCH_URL, timeout_ms=30_000)
                 human_pause(2.0, 3.0)

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import signal
 import sys
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, List
 
 from .chrome_launcher import ChromeLauncher
@@ -57,6 +60,17 @@ def _setup_signals() -> None:
             signal.signal(sig, _on_signal)
         except Exception:
             pass
+
+
+# 사용자 개입이 필요한 종료(결제 거절 등)에서는 watcher 가 띄운 Chrome 을 닫지 않는다 —
+# 2026-11-07 00:35: 개입 필요라고 알리면서 창을 닫아 버려 사람이 이어서 결제할 수 없었다.
+_KEEP_BROWSER_OPEN = False
+
+
+def _keep_browser_open(reason: str) -> None:
+    global _KEEP_BROWSER_OPEN
+    _KEEP_BROWSER_OPEN = True
+    LOGGER.warning("Chrome 을 열어 둡니다 (사용자 개입 필요): %s", reason)
 
 
 def _sleep_with_jitter(min_s: float, max_s: float) -> None:
@@ -157,6 +171,68 @@ _RESERVED_COUNT: int = 0
 # KTXA_RESERVE_SAME_TRAIN=true 일 때 첫 건이 잡힌 출발시각 — 이후 후보는 이 열차로만 좁힌다.
 _SAME_TRAIN_DEPART: str | None = None
 
+# 확보 기록 영구저장 (2026-11-07): 메모리에만 있으면 1건 결제 후 재시작(사람/웹서버 AI 복구) 때
+# 0 부터 다시 세어 초과 구매한다. 같은 여정(날짜·구간·인원 구성)이면 파일에서 이어서 센다.
+_RESERVED_STATE_PATH = Path("runs/reserved_state.json")
+
+
+def _reserved_signature(config: KTXAConfig) -> str:
+    people = ",".join(f"{k}:{v}" for k, v in sorted(config.passenger_counts().items()))
+    return f"{config.ktxa_date.isoformat()}|{config.ktxa_origin}|{config.ktxa_dest}|{people}"
+
+
+def _load_reserved_state(config: KTXAConfig) -> None:
+    """부팅 시 호출. 같은 여정의 기록이 있으면 복원, 아니면 0 부터."""
+    global _RESERVED_COUNT, _SAME_TRAIN_DEPART
+    _RESERVED_DEPARTS.clear()
+    _RESERVED_COUNT = 0
+    _SAME_TRAIN_DEPART = None
+    try:
+        data = json.loads(_RESERVED_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict) or data.get("signature") != _reserved_signature(config):
+        return
+    _RESERVED_DEPARTS.update(str(d) for d in (data.get("departs") or []))
+    _RESERVED_COUNT = int(data.get("count") or 0)
+    _SAME_TRAIN_DEPART = data.get("same_train_depart") or None
+    if _RESERVED_COUNT or _RESERVED_DEPARTS:
+        LOGGER.warning(
+            "이전 확보 기록 복원: %d건 (%s) — 같은 여정이라 이어서 센다. "
+            "새로 세려면 확보 기록 초기화(/api/watcher/reserved/reset) 또는 %s 삭제",
+            max(_RESERVED_COUNT, len(_RESERVED_DEPARTS)), ", ".join(sorted(_RESERVED_DEPARTS)),
+            _RESERVED_STATE_PATH,
+        )
+
+
+def _save_reserved_state(config: KTXAConfig) -> None:
+    try:
+        _RESERVED_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _RESERVED_STATE_PATH.write_text(json.dumps({
+            "signature": _reserved_signature(config),
+            "date": config.ktxa_date.isoformat(), "origin": config.ktxa_origin, "dest": config.ktxa_dest,
+            "count": _RESERVED_COUNT, "departs": sorted(_RESERVED_DEPARTS),
+            "same_train_depart": _SAME_TRAIN_DEPART,
+            "updated": datetime.now().isoformat(timespec="seconds"),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        LOGGER.warning("확보 기록 저장 실패: %s", e)
+
+
+def _reserve_goal(config: KTXAConfig) -> tuple[int, int]:
+    """(확보, 목표). 같은 열차 모드는 건수, 기본 모드는 열차 수 기준."""
+    limit = config.ktxa_reserve_limit
+    if config.ktxa_reserve_same_train:
+        return _RESERVED_COUNT, limit
+    n_times = len(config.ktxa_times)
+    total = n_times if limit <= 0 else min(limit, n_times)
+    return len(_RESERVED_DEPARTS), total
+
+
+def _goal_already_met(config: KTXAConfig) -> bool:
+    got, total = _reserve_goal(config)
+    return total > 0 and got >= total
+
 
 def _mark_reserved(config: KTXAConfig, depart: str, notifier) -> bool:
     """확보 기록 후, 목표 도달 여부(=종료 여부) 반환.
@@ -168,6 +244,9 @@ def _mark_reserved(config: KTXAConfig, depart: str, notifier) -> bool:
     global _RESERVED_COUNT, _SAME_TRAIN_DEPART
     _RESERVED_DEPARTS.add(depart)
     _RESERVED_COUNT += 1
+    if config.ktxa_reserve_same_train and _SAME_TRAIN_DEPART is None:
+        _SAME_TRAIN_DEPART = depart
+    _save_reserved_state(config)   # 재시작해도 이어서 세도록 즉시 기록
     limit = config.ktxa_reserve_limit
     if config.ktxa_reserve_same_train:
         if _SAME_TRAIN_DEPART is None:
@@ -267,6 +346,7 @@ def run_once(
         return False
     except UserActionRequired as e:
         LOGGER.error("User action required during reservation: %s", e)
+        _keep_browser_open(str(e))
         _notify(notifier, f"❌ 예약 단계 사용자 개입 필요\n{e}")
         return True
     except SiteLayoutChanged as e:
@@ -298,10 +378,12 @@ def run_once(
         return _mark_reserved(config, best["depart"], notifier)
     except UserActionRequired as e:
         LOGGER.error("결제 단계에서 사용자 개입 필요: %s", e)
+        _keep_browser_open(str(e))
         _notify(notifier, f"❌ 결제 단계 사용자 개입 필요\n{e}")
         return True
     except SiteLayoutChanged as e:
         LOGGER.error("결제 단계 site layout: %s", e)
+        _keep_browser_open(str(e))   # 좌석은 hold 상태 — 사람이 이어서 결제할 수 있게
         _notify(notifier, f"❌ 결제 단계 사이트 구조 변경\n{e}")
         return True
     except ValueError as e:
@@ -333,6 +415,17 @@ def main() -> int:
         " (모두 같은 열차로)" if config.ktxa_reserve_same_train else "",
         config.ktxa_poll_min, config.ktxa_poll_max,
     )
+
+    _load_reserved_state(config)
+    if _goal_already_met(config):
+        got, total = _reserve_goal(config)
+        LOGGER.warning(
+            "이미 목표를 확보한 여정 (%d/%d, %s) — 감시를 시작하지 않습니다. "
+            "새 여정이면 날짜·구간·인원을 바꾸고, 같은 여정을 더 사려면 KTXA_RESERVE_LIMIT 를 올리거나 "
+            "확보 기록을 초기화하세요.",
+            got, total, ", ".join(sorted(_RESERVED_DEPARTS)),
+        )
+        return 0
 
     notifier = _build_teams_notifier(config)
     _notify(
@@ -458,7 +551,11 @@ def main() -> int:
                     _sleep_with_jitter(5.0, 12.0)
     finally:
         # 어떤 경로로 끝나든(예약 성공/차단 중단/예외) 집계는 남긴다.
-        launcher.shutdown_if_owned()
+        if _KEEP_BROWSER_OPEN:
+            launcher.release_control()
+            LOGGER.warning("사용자 개입 필요 — Chrome 을 닫지 않고 제어권만 해제 (port=%d)", launcher.port)
+        else:
+            launcher.shutdown_if_owned()
         LOGGER.info("조회 집계 — %s", stats.summary())
 
     LOGGER.info("Watcher stopped")

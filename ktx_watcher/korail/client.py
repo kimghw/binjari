@@ -361,6 +361,14 @@ def attach_context_popup_guard(context) -> None:
         # A tab created by the client is not an advertising popup.
         if new_page.opener() is None:
             return
+        # 결제 진행 중에는 새 창(카드사 인증 등)을 건드리지 않는다 —
+        # 자동 '확인'/close 가 결제를 끊을 수 있다 (payment.perform_payment 가 플래그를 켠다).
+        if getattr(context, "_hands_off_popups", False):
+            try:
+                LOGGER.warning("결제 중 새 창 감지 — 자동 처리 안 함: %s", new_page.url)
+            except Exception:
+                pass
+            return
         try:
             new_page.wait_for_load_state("domcontentloaded", timeout=3000)
         except Exception:

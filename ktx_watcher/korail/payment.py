@@ -34,11 +34,17 @@ from ..config import KTXAConfig
 from . import CaptchaDetected, SiteLayoutChanged, UserActionRequired
 from .client import (
     KorailSPAClient,
+    _PROCEED_KEYWORDS,
+    _click_proceed_if_asked,
+    _click_visible,
     dismiss_all_popups,
     human_click,
     human_pause,
     human_type,
 )
+from . import selectors as S
+from ..diagnostics import record_payment_evidence
+from ..dom import read_page_state
 
 LOGGER = logging.getLogger("ktx_watcher_spa.korail.payment")
 
@@ -197,6 +203,30 @@ def _set_card_year(page: Page, data: Dict[str, str]) -> None:
 
 # ─────────────────── main API ───────────────────
 
+_COMPLETE_URL_PARTS = ("/myticket/list", "/payment/complete", "/ticket/myticket")
+# 결제 응답 모달 분류 키워드 (2026-11-07). 오류형은 닫지 않고 사용자에게 넘긴다.
+_PAYMENT_ERROR_KEYWORDS = (
+    "실패", "오류", "거절", "불가", "점검", "잘못", "유효하지", "일치하지", "초과", "한도",
+    "확인하세요", "확인해 주세요", "확인해주세요", "입력하세요", "입력해 주세요", "입력해주세요",
+)
+_PAYMENT_OK_KEYWORDS = ("완료", "발권", "성공")
+
+
+def _is_complete_url(url: str) -> bool:
+    return any(p in (url or "") for p in _COMPLETE_URL_PARTS)
+
+
+def _classify_payment_modal(txt: str) -> str:
+    """'proceed'(진행 확인 → 네) | 'error'(닫지 않고 개입) | 'ok'(완료 안내 → 확인) | 'unknown'(확인)."""
+    if any(kw in txt for kw in _PROCEED_KEYWORDS):
+        return "proceed"
+    if any(kw in txt for kw in _PAYMENT_ERROR_KEYWORDS):
+        return "error"
+    if any(kw in txt for kw in _PAYMENT_OK_KEYWORDS):
+        return "ok"
+    return "unknown"
+
+
 def perform_payment(
     client: KorailSPAClient,
     config: KTXAConfig,
@@ -315,12 +345,52 @@ def perform_payment(
     except PWTimeoutError as e:
         raise SiteLayoutChanged(f"결제/발권 클릭 실패: {e}") from e
 
-    # 8) popup polling — 결제 진행 중 안내 모달 / 완료 안내 자동 dismiss
-    for poll_i in range(15):
-        _time.sleep(1.0)
-        dismissed = dismiss_all_popups(client.context)
-        if dismissed:
-            LOGGER.info("결제 단계 popup dismiss iter=%d count=%d", poll_i, dismissed)
+    # 8) 결제 응답 대기 — 모달을 무조건 닫지 않고 텍스트·화면을 남긴다.
+    #    (2026-11-07 00:35 실패: 응답 모달을 '확인' 자동 클릭으로 닫아 거절 사유가 유실됨)
+    #    완료 URL → 성공 / 진행 확인형 → '네' / 완료 안내 → '확인' / 오류·거절 → 닫지 않고 개입 요청
+    #    새 창(카드사 인증 등) → 건드리지 않고 개입 요청
+    client.context._hands_off_popups = True
+    pages_before = len(client.context.pages)
+    last_modal = ""
+    try:
+        for poll_i in range(25):
+            _time.sleep(1.0)
+            url = page.url or ""
+            if _is_complete_url(url):
+                break
+            if len(client.context.pages) > pages_before:
+                extra = [p.url for p in client.context.pages[pages_before:] if not p.is_closed()]
+                record_payment_evidence(page, "new-window", " / ".join(extra))
+                raise UserActionRequired(
+                    f"결제 중 새 창이 열림(카드사 인증 추정) — 자동 처리하지 않음. 창에서 직접 진행하세요: {extra}"
+                )
+            try:
+                modals = [m.strip() for m in read_page_state(page).get("modals", []) if m and m.strip()]
+            except Exception:
+                continue
+            if not modals:
+                continue
+            txt = modals[0]
+            if txt != last_modal:
+                last_modal = txt
+                LOGGER.warning("결제 단계 모달 (iter=%d): %s", poll_i, txt[:300].replace("\n", " | "))
+                record_payment_evidence(page, f"modal-{poll_i}", txt)
+            kind = _classify_payment_modal(txt)
+            if kind == "proceed":
+                if _click_proceed_if_asked(page, txt):
+                    LOGGER.info("진행 확인 모달 → '네' 클릭")
+                    last_modal = ""
+                continue
+            if kind == "error":
+                raise UserActionRequired(
+                    f"결제 거절/오류 안내 — {txt[:200]!r} (url={url}) — 모달을 닫지 않았습니다. 창에서 직접 확인하세요."
+                )
+            # 완료 안내 또는 분류 불가 안내: 텍스트는 남겼으니 '확인' 으로 진행
+            if _click_visible(page, S.MODAL_CONFIRM_BUTTON):
+                LOGGER.info("안내 모달(%s) → '확인' 클릭: %s", kind, txt[:80].replace("\n", " | "))
+                last_modal = ""
+    finally:
+        client.context._hands_off_popups = False
 
     try:
         page.wait_for_load_state("networkidle", timeout=20_000)
@@ -330,34 +400,17 @@ def perform_payment(
 
     # 9) 결제 완료 확인 — URL 변화가 가장 명확한 신호.
     #   성공: /payment/payment → /myticket/list (승차권 확인) 또는 /payment/complete
-    #   실패/미진행: /payment/payment 그대로
+    #   실패/미진행: /payment/payment 그대로 → 화면을 남기고 사용자 개입 (창은 main 이 열어 둔다)
     url = page.url or ""
-    if any(p in url for p in ("/myticket/list", "/payment/complete", "/ticket/myticket")):
+    if _is_complete_url(url):
         LOGGER.info("✅✅ 결제/발권 완료 (url=%s)", url)
+        record_payment_evidence(page, "complete", "")
         return
 
-    # URL 그대로 → 결제 안 됨. body 텍스트로 실패 사유 추정.
-    try:
-        html = page.content()
-    except Exception:
-        html = ""
-
-    fail_kw = (
-        "결제 실패", "결제실패",
-        "유효기간",
-        "비밀번호",
-        "인증번호 오류",
-        "카드번호",
-        "동의",
-    )
-    detected = [kw for kw in fail_kw if kw in html]
-    if detected:
-        raise UserActionRequired(
-            f"결제 미완료 — 키워드 감지: {detected} (url={url})"
-        )
-
+    record_payment_evidence(page, "incomplete", last_modal)
     raise UserActionRequired(
-        f"결제 완료 URL 변화 안 됨 — url 그대로 ({url}). 동의/카드정보/네트워크 확인 필요."
+        f"결제 미완료 — URL 그대로 ({url}). 마지막 모달: {last_modal[:200]!r}. "
+        "창을 열어 두었습니다. 화면과 runs/payment 캡처를 확인하세요."
     )
 
 

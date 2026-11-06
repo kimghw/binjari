@@ -3375,6 +3375,18 @@ WATCHER_LOG = Path("./runs/watcher_web.log")
 _WATCHER: Dict[str, Any] = {"proc": None, "started_at": None, "logf": None}
 
 
+RESERVED_STATE_PATH = Path("./runs/reserved_state.json")   # ktx_watcher.main._RESERVED_STATE_PATH 와 동일
+
+
+def _read_reserved_state() -> Optional[Dict[str, Any]]:
+    """워처의 확보 기록(영구저장). 없으면 None."""
+    try:
+        data = json.loads(RESERVED_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _watcher_running() -> bool:
     p = _WATCHER.get("proc")
     return p is not None and p.poll() is None
@@ -3396,6 +3408,7 @@ def api_watcher_status() -> Dict[str, Any]:
         "pid": p.pid if running else None,
         "started_at": _WATCHER.get("started_at"),
         "returncode": None if (running or p is None) else p.returncode,
+        "reserved": _read_reserved_state(),
         "log_tail": tail,
     }
 
@@ -3440,6 +3453,21 @@ def api_watcher_start() -> Dict[str, Any]:
     _AI["restarts"] = 0
     _WATCHER["stopping"] = False
     return _start_watcher_proc()
+
+
+@app.post("/api/watcher/reserved/reset")
+def api_watcher_reserved_reset() -> Dict[str, Any]:
+    """확보 기록(runs/reserved_state.json) 삭제 — 같은 여정을 처음부터 다시 셀 때. 감시 중엔 거부."""
+    if _watcher_running():
+        raise HTTPException(status_code=409, detail="감시 실행 중에는 확보 기록을 초기화할 수 없습니다. 먼저 중지하세요.")
+    existed = RESERVED_STATE_PATH.is_file()
+    try:
+        if existed:
+            RESERVED_STATE_PATH.unlink()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"초기화 실패: {exc}") from exc
+    LOGGER.info("확보 기록 초기화 (%s)", "삭제" if existed else "없었음")
+    return {"ok": True, "existed": existed}
 
 
 @app.post("/api/watcher/stop")
@@ -3981,6 +4009,8 @@ COMMON_JS = """
       #watcherFab .wf-start:hover { background: #0da046; }
       #watcherFab .wf-stop { background: #c02020; }
       #watcherFab .wf-stop:hover { background: #d92c2c; }
+      #watcherFab .wf-reset { background: #6b6b6b; }
+      #watcherFab .wf-reset:hover { background: #808080; }
       #watcherFab button:disabled { opacity: .55; cursor: not-allowed; }
     `;
     document.head.appendChild(s2);
@@ -3989,13 +4019,15 @@ COMMON_JS = """
     fab.innerHTML =
       '<span class="wf-state" id="wfState">감시 상태 확인 중…</span>' +
       '<button type="button" class="wf-start" id="wfStart" hidden>▶ 감시 시작</button>' +
-      '<button type="button" class="wf-stop" id="wfStop" hidden>■ 감시 중지</button>';
+      '<button type="button" class="wf-stop" id="wfStop" hidden>■ 감시 중지</button>' +
+      '<button type="button" class="wf-reset" id="wfReset" hidden title="같은 여정의 확보 기록을 지우고 처음부터 다시 셉니다">↺ 확보 기록 초기화</button>';
     document.body.appendChild(fab);
     // 설정 페이지의 sticky 저장바와 겹치지 않게 위로 올림
     if (document.querySelector('.savebar')) fab.style.bottom = '96px';
     const state = document.getElementById('wfState');
     const startBtn = document.getElementById('wfStart');
     const stopBtn = document.getElementById('wfStop');
+    const resetBtn = document.getElementById('wfReset');
     startBtn.onclick = async () => {
       startBtn.disabled = true;
       try {
@@ -4023,6 +4055,20 @@ COMMON_JS = """
       stopBtn.disabled = false;
       poll();
     };
+    resetBtn.onclick = async () => {
+      if (!confirm('확보 기록을 초기화할까요? 같은 여정으로 다시 시작하면 처음부터 셉니다(초과 구매 주의).')) return;
+      resetBtn.disabled = true;
+      try {
+        const r = await fetch('/api/watcher/reserved/reset', { method: 'POST' });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail || r.status);
+      } catch (e) {
+        state.textContent = '초기화 실패: ' + e.message;
+        state.className = 'wf-state err';
+      }
+      resetBtn.disabled = false;
+      poll();
+    };
     async function poll() {
       try {
         const s = await (await fetch('/api/watcher/status')).json();
@@ -4031,6 +4077,7 @@ COMMON_JS = """
           state.className = 'wf-state running';
           startBtn.hidden = true;
           stopBtn.hidden = false;
+          resetBtn.hidden = true;
         } else {
           if (s.returncode === 0) {
             state.textContent = '✅ 감시 완료';
@@ -4044,6 +4091,15 @@ COMMON_JS = """
           }
           startBtn.hidden = false;
           stopBtn.hidden = true;
+          // 확보 기록(영구저장): 같은 여정 재시작 시 이어서 세므로 건수를 보여주고 초기화 버튼 제공
+          const rs = s.reserved;
+          const got = rs ? Math.max(rs.count || 0, (rs.departs || []).length) : 0;
+          if (got > 0) {
+            state.textContent += ' · 확보 ' + got + '건 (' + (rs.date || '') + ' ' + (rs.origin || '') + '→' + (rs.dest || '') + ')';
+            resetBtn.hidden = false;
+          } else {
+            resetBtn.hidden = true;
+          }
         }
       } catch (e) { /* 서버 미응답 — 다음 폴링 */ }
     }

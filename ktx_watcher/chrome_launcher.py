@@ -9,6 +9,7 @@ watcher 가 직접 chrome.exe 를 ``--remote-debugging-port=<port>`` 로 띄우�
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import socket
@@ -167,16 +168,21 @@ class ChromeLauncher:
             "--remote-allow-origins=*",
             "--no-first-run",
             "--no-default-browser-check",
-            # 다른 가상 데스크톱/가려진 창에서도 렌더링·타이머 스로틀링 방지
-            "--disable-features=CalculateNativeWinOcclusion",
+            # 다른 가상 데스크톱/가려진 창에서도 렌더링·타이머 스로틀링 방지.
+            # PasswordLeakDetection: 로그인 뒤 Chrome 자체 "비밀번호 유출" 대화상자가 페이지 입력을
+            # 막아 워처가 죽음 (2026-11-07 01:16 실측: 1건 발권 후 인원 팝업 클릭 무반응 → 종료).
+            "--disable-features=CalculateNativeWinOcclusion,PasswordLeakDetection",
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
+            # watcher 가 terminate 로 끝낸 뒤 다음 기동 때 뜨는 "페이지를 복원하시겠습니까?" 풍선 숨김
+            "--hide-crash-restore-bubble",
         ]
         if self.user_data_dir:
             self.user_data_dir.mkdir(parents=True, exist_ok=True)
             args.append(f"--user-data-dir={self.user_data_dir}")
         args.append("about:blank")
 
+        self._mark_clean_exit()
         LOGGER.info("Chrome 디버그 모드 기동: %s (port=%d)", self.exe_path, self.port)
         # stdout/stderr 는 무시 (Chrome 이 콘솔에 잡히면 종료 시 같이 죽음 회피)
         self._proc = subprocess.Popen(
@@ -200,6 +206,29 @@ class ChromeLauncher:
         raise RuntimeError(
             f"Chrome 디버그 포트 {self.port} 가 {self.startup_timeout}s 안에 응답하지 않음"
         )
+
+    def _mark_clean_exit(self) -> None:
+        """프로필 Preferences 의 종료 상태를 '정상' 으로 바꿔 "페이지를 복원하시겠습니까?" 풍선을 막는다.
+
+        watcher 는 Chrome 을 terminate 로 끝내므로 다음 기동 때 Chrome 이 비정상 종료로 본다
+        (2026-11-07 01:2x 실측, 사용자 보고). 플래그(--hide-crash-restore-bubble)와 이중 방어.
+        """
+        if not self.user_data_dir:
+            return
+        prefs = Path(self.user_data_dir) / "Default" / "Preferences"
+        if not prefs.is_file():
+            return
+        try:
+            data = json.loads(prefs.read_text(encoding="utf-8"))
+            prof = data.setdefault("profile", {})
+            if prof.get("exit_type") == "Normal" and prof.get("exited_cleanly") is True:
+                return
+            prof["exit_type"] = "Normal"
+            prof["exited_cleanly"] = True
+            prefs.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            LOGGER.info("Chrome 프로필 종료 상태를 정상으로 표시 (복원 풍선 방지)")
+        except Exception as e:
+            LOGGER.debug("Preferences 수정 실패(무시): %s", e)
 
     def _move_to_vdesk(self) -> None:
         """Chrome 창을 별도 가상 데스크톱(vdesk_name)으로 이동. 실패해도 진행.

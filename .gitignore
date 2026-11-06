@@ -44,3 +44,5 @@ launch_binjari.bat
 
 # Claude Code 로컬 설정 (개인 권한/환경)
 .claude/settings.local.json
+# azure_env_export 결과(점 없는 이름) — 실 시크릿, 커밋 금지
+env.azure

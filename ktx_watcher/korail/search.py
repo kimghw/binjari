@@ -11,6 +11,8 @@
 
 차단 안내는 닫기 전에 기록하고 같은 조건으로 최대 2회 재조회한다.
 빈 목록·조건 불일치·파싱 실패는 명시적 차단과 구분한다.
+reload·탭·재조회 직후 목록이 그려지기 전에 읽으면 0행이 나오므로, 행·'열차 없음'
+마커·모달 중 하나가 뜰 때까지 기다렸다 읽고, 그래도 비면 새로고침 1회로 재조회한다.
 """
 
 from __future__ import annotations
@@ -54,6 +56,11 @@ _TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
 #  축소도 함께 본다.)
 # 프로세스 메모리에만 둔다 — 재시작하면 초기화되고, 그래도 0건 규칙이 남는다.
 _ROW_BASELINE: Dict[str, int] = {}
+# 같은 조건 재조회(조회 재클릭·새로고침) 누적 횟수. perform_search 가 열차종류 탭을 다시
+# 적용해야 하는지(재조회로 탭이 '전체' 로 돌아갔는지) 판단하는 데만 쓴다.
+# (탭 'active' 판정은 이 사이트에서 클릭 후에도 True 가 되지 않아 — 2026-11-06 18:22 실측,
+#  탭 3연속 클릭 — 활성 여부로는 재적용 필요를 알 수 없다.)
+_REQUERY_COUNT = 0
 
 
 # ─────────────────── form helpers ───────────────────
@@ -481,6 +488,7 @@ def _click_train_type_tab(page: Page, train_type: str) -> bool:
             loc.click(timeout=4000)
             LOGGER.info("열차종류 탭 '%s' 클릭 (attempt=%d)", train_type, attempt + 1)
             human_pause(0.8, 1.4)
+            _wait_result_list(page, where="train type tab")
             return True
         except Exception as e:
             LOGGER.warning("열차종류 탭 클릭 attempt=%d 실패: %s", attempt + 1, e)
@@ -743,10 +751,70 @@ def _read_rows(page: Page) -> List[Dict[str, Any]]:
         raise SiteLayoutChanged(f"Result DOM parse failed: {exc}") from exc
 
 
+# ── 결과 목록 렌더 대기 ───────────────────────────────────────────────
+# reload·열차종류 탭·가드 재조회 직후에는 networkidle + 고정 대기만으로는 부족하다.
+# React 가 목록을 그리기 전에 읽으면 0행이 나와 '결과 없음' 으로 오판하고 워처가 죽는다
+# (2026-11-06 18:05 KTX 탭 직후 / 18:06 reload 직후 / 18:07 가드 재조회 직후 — 세 번 모두
+#  차단 안내·'열차 없음' 마커 없이 0행. 사용자 관찰: 초기 응답이 비면 refresh 로 정상).
+# 행·마커·모달 중 하나가 DOM 에 뜰 때까지 페이지 안에서 폴링한다 (Python 쪽 반복 조회 없이
+# wait_for_function 한 번). 보이는 모달이 최우선 — 늦게 뜬 -8002/-8003 안내가 행·마커와 같이
+# 있어도 가려지지 않게 한다. '열차 없음' 마커는 **보일 때만** 센다 (2026-11-06 19:55 실측:
+# -8003 응답에 마커와 모달이 같이 뜸 — 마커만 보고 '진짜 열차 없음' 으로 확정하면 안 된다).
+_RESULT_READY_JS = """({rows, empty, modal}) => {
+    const visible = el => el.getClientRects().length > 0 &&
+        getComputedStyle(el).visibility !== 'hidden';
+    if ([...document.querySelectorAll(modal)].some(visible)) return 'modal';
+    if (document.querySelectorAll(rows).length > 0) return 'rows';
+    if ([...document.querySelectorAll(empty)].some(visible)) return 'empty';
+    return null;
+}"""
+_RESULT_READY_STATES = ("rows", "empty", "modal")
+
+
+def _wait_result_list(page: Page, *, where: str, timeout_ms: int = 10_000) -> Optional[str]:
+    """결과 목록이 실제로 렌더될 때까지 대기. 'rows' | 'empty' | 'modal' | None(시간 초과).
+
+    시간 초과만 None 으로 돌린다. 브라우저 소실·스크립트 오류는 '미렌더' 로 섞지 않고 올린다.
+    """
+    try:
+        state = page.wait_for_function(
+            _RESULT_READY_JS,
+            arg={"rows": "li.tckList", "empty": S.RESULT_EMPTY_MARKER,
+                 "modal": ".ReactModal__Content, [role=dialog]"},
+            timeout=timeout_ms,
+        ).json_value()
+    except PWTimeoutError:
+        state = None
+    except Exception as e:
+        LOGGER.warning("결과 목록 대기 실패 (%s): %s: %s", where, type(e).__name__, e)
+        raise
+    if state not in _RESULT_READY_STATES:
+        state = None
+    if state != "rows":
+        LOGGER.warning("결과 목록 대기 (%s): %s", where,
+                       state or f"{timeout_ms // 1000}s 내 행 미렌더")
+    return state
+
+
+def _await_result(
+    page: Page, *, stage: str, timeout_ms: int = 10_000,
+) -> tuple[Optional[str], bool]:
+    """렌더 대기 뒤 행이 아니면 가드 분류까지. (state, guard_found).
+
+    대기 중 뒤늦게 뜬 차단 안내는 여기서 기록·닫기까지 한다 — 안 그러면 0행만 보고
+    '안내 없는 빈 목록' 으로 잘못 보고한다 (Codex 교차 검토 2026-11-06 지적).
+    """
+    state = _wait_result_list(page, where=stage, timeout_ms=timeout_ms)
+    if state == "rows":
+        return state, False
+    return state, _check_guard(page, stage)
+
+
 def _requery_after_guard(
     page: Page, *, config: KTXAConfig | None, where: str, attempts: int = 2,
 ) -> List[Dict[str, Any]]:
     """Bounded retry with unchanged query conditions; never assume a one-time guard."""
+    global _REQUERY_COUNT
     for attempt in range(1, attempts + 1):
         if config is not None:
             validate_query(page, config, "before guard retry")
@@ -759,6 +827,7 @@ def _requery_after_guard(
             # The compact result header hides its query button. Reload preserves
             # the selected day; never click the separate next-day query control.
             page.reload(wait_until="domcontentloaded", timeout=20_000)
+        _REQUERY_COUNT += 1
         try:
             page.wait_for_load_state("networkidle", timeout=12_000)
         except PWTimeoutError:
@@ -771,10 +840,22 @@ def _requery_after_guard(
             continue
         if config is not None:
             validate_query(page, config, "after guard retry")
+        _state, late_guard = _await_result(page, stage=f"{where}/retry-{attempt}")
+        if late_guard:
+            # 대기 중 뜬 차단 안내 — 위의 즉시 감지와 같은 규칙으로 센다
+            if attempt == attempts:
+                raise GuardBlocked(f"Repeated explicit guard ({where}, {attempt} retries, late)",
+                                   explicit=True)
+            continue
         rows = _read_rows(page)
         if rows:
             LOGGER.info("Retry returned %d rows with the same conditions", len(rows))
             return rows
+        if attempt < attempts:
+            # 안내도 마커도 없는 0행 — 렌더 지연일 수 있어 같은 조건으로 한 번 더 (refresh)
+            LOGGER.warning("Guard retry (%s) %d/%d: 목록 0행(새 안내 없음) — 재조회 1회 더",
+                           where, attempt, attempts)
+            continue
         raise SearchResultUnavailable(
             "Guard dismissed, but result list is empty without a new explicit notice")
     raise GuardBlocked(f"Explicit guard persists ({where})", explicit=True)
@@ -801,6 +882,9 @@ def submit_search(page: Page, config: KTXAConfig | None = None) -> List[Dict[str
         return _requery_after_guard(page, config=config, where="submit")
     if config is not None:
         validate_query(page, config, "after submit")
+    _state, late_guard = _await_result(page, stage="submit/wait")
+    if late_guard:
+        return _requery_after_guard(page, config=config, where="submit/wait")
     return _read_rows(page)
 
 
@@ -814,6 +898,67 @@ def _empty_marker_visible(page: Page) -> bool:
         return S.RESULT_EMPTY_TEXT in page.locator("body").inner_text(timeout=2000)
     except Exception:
         return False
+
+
+def _requery_when_empty(
+    page: Page, config: KTXAConfig, *, where: str,
+) -> List[Dict[str, Any]]:
+    """목록이 비었는데 차단 안내도 '열차 없음' 마커도 없을 때 — 같은 조건으로 새로고침 1회.
+
+    -8002 뒤의 _requery_after_guard 와 같은 원리(초기 응답이 비면 refresh 로 정상 목록).
+    조건은 바꾸지 않는다. 새로고침 후 차단 안내가 뜨면 가드 재조회 경로로 넘긴다.
+    """
+    global _REQUERY_COUNT
+    validate_query(page, config, f"before empty retry ({where})")
+    LOGGER.warning("결과 목록 0행 (%s) — 차단 안내·열차 없음 마커 없음, 새로고침 1회 재조회", where)
+    human_pause(1.0, 2.0)
+    page.reload(wait_until="domcontentloaded", timeout=20_000)
+    _REQUERY_COUNT += 1
+    try:
+        page.wait_for_load_state("networkidle", timeout=12_000)
+    except PWTimeoutError:
+        pass
+    human_pause(1.5, 2.5)
+    if _check_guard(page, f"{where}/empty-retry"):
+        return _requery_after_guard(page, config=config, where=f"{where}/empty-retry")
+    validate_query(page, config, f"after empty retry ({where})")
+    _state, late_guard = _await_result(page, stage=f"{where}/empty-retry")
+    if late_guard:
+        return _requery_after_guard(page, config=config, where=f"{where}/empty-retry")
+    rows = _read_rows(page)
+    if rows:
+        LOGGER.info("새로고침 재조회로 %d행 수신 (%s)", len(rows), where)
+    return rows
+
+
+def _settle_rows(
+    page: Page, config: KTXAConfig, raw: List[Dict[str, Any]], *, where: str,
+    budget: Optional[Dict[str, int]] = None, timeout_ms: int = 10_000,
+) -> List[Dict[str, Any]]:
+    """0행이면 렌더 완료를 기다려 다시 읽고, 그래도 비면(마커 없음) 새로고침으로 재조회.
+
+    budget={"refresh": n} 은 perform_search 한 번당 새로고침 재조회 예산 (호출당이 아님).
+    """
+    if raw:
+        return raw
+    state, guard = _await_result(page, stage=where, timeout_ms=timeout_ms)
+    if guard:
+        return _requery_after_guard(page, config=config, where=where)
+    if state == "modal":
+        # 차단 안내가 아닌 공지 모달 — 닫고 한 번 더 기다린다 (그 사이 가드가 뜨면 분류)
+        dismiss_notice_modal(page)
+        _state2, guard2 = _await_result(page, stage=f"{where}/after modal", timeout_ms=timeout_ms)
+        if guard2:
+            return _requery_after_guard(page, config=config, where=f"{where}/after modal")
+    raw = _read_rows(page)
+    if raw or _empty_marker_visible(page):
+        return raw
+    if budget is not None:
+        if budget.get("refresh", 0) <= 0:
+            LOGGER.warning("결과 목록 0행 (%s) — 이번 조회의 새로고침 예산 소진, 재조회 생략", where)
+            return raw
+        budget["refresh"] -= 1
+    return _requery_when_empty(page, config, where=where)
 
 
 def _expand_more_until(
@@ -882,8 +1027,7 @@ def perform_search(
         and not _condition_errors(_query_state(page), config)
     )
     if on_result:
-        # Verify passenger types too; a total alone cannot distinguish adult/senior.
-        _set_passengers(page, config)
+        # 인원 구성은 폼 입력 시 팝업으로 이미 검증됨 → 결과 페이지에서는 라벨 검사만 하고 바로 새로고침
         validate_query(page, config, "before reload")
         page.reload(wait_until="domcontentloaded", timeout=20_000)
         try:
@@ -908,11 +1052,29 @@ def perform_search(
         raw = _requery_after_guard(page, config=config, where="result options")
     elif srt_changed:
         raw = _read_rows(page)
-    if raw and _click_train_type_tab(page, config.ktxa_train_type):
+    budget = {"refresh": 1}   # 이번 perform_search 전체에서 빈 목록 새로고침은 1회
+    raw = _settle_rows(page, config, raw, where="result list", budget=budget)
+    # 열차종류 탭 적용. 탭 클릭 뒤 재조회(새로고침/조회 재클릭)가 끼면 탭이 '전체' 로 돌아가므로,
+    # 재조회가 실제로 있었을 때만 다시 적용한다 (최대 3회). 이미 눌린 탭(aria-pressed)은
+    # _click_train_type_tab 이 건너뛴다.
+    for _ in range(3):
+        if not raw or not _click_train_type_tab(page, config.ktxa_train_type):
+            break
+        requeries_before = _REQUERY_COUNT
         if _check_guard(page, "after train type tab"):
             raw = _requery_after_guard(page, config=config, where="after train type tab")
         else:
-            raw = _read_rows(page)
+            # 탭 클릭 안에서 이미 한 번 기다렸으므로 여기서는 짧게만 더 본다
+            raw = _settle_rows(page, config, _read_rows(page), where="after train type tab",
+                               budget=budget, timeout_ms=4_000)
+        if _REQUERY_COUNT == requeries_before:
+            break
+        # 재조회로 결과 옵션이 초기화될 수 있다 — 수서 함께 보기도 다시 맞춘다 (바뀌면 자동 재조회)
+        if _ensure_srt_on_result(page, config):
+            raw = _settle_rows(page, config, _read_rows(page), where="srt after requery",
+                               budget=budget, timeout_ms=4_000)
+    else:
+        LOGGER.warning("열차종류 탭 재적용 한도(3회) 소진 — 탭 미적용 상태일 수 있어 행의 열차종류로 거른다")
     validate_query(page, config, "result conditions")
     raw = _expand_more_until(page, config, raw)
     validate_query(page, config, "after pagination")
@@ -944,12 +1106,17 @@ def perform_search(
     type_dropped = 0
     time_dropped = 0
     route_dropped = 0
+    duration_dropped = 0
     for r in raw:
         if not _route_matches(r, config):
             route_dropped += 1
             continue
         if not _is_candidate_time(r["depart_time"], config):
             time_dropped += 1
+            continue
+        # 소요시간 상한 (KTXA_MAX_DURATION_MIN): 경유 등으로 오래 걸리는 열차 제외
+        if not _within_max_duration(r, config):
+            duration_dropped += 1
             continue
         # 열차종류 이중 방어 — 탭 클릭이 실패하면 '전체' 목록이 그대로 파싱된다
         # (2026-07-25 실측: KTXA_TRAIN_TYPE=KTX 인데 ITX-새마을 row 가 후보로 잡혀 예약 진행됨)
@@ -1010,8 +1177,8 @@ def perform_search(
     if type_dropped:
         LOGGER.info("열차종류 불일치 %d건 제외 (KTXA_TRAIN_TYPE=%s)", type_dropped, config.ktxa_train_type)
     LOGGER.info("후보 %d건 (전체 row %d건)", len(candidates), len(raw))
-    LOGGER.info("제외 행: 구간=%d 시간=%d 열차종류=%d; 나머지는 좌석 조건 확인",
-                route_dropped, time_dropped, type_dropped)
+    LOGGER.info("제외 행: 구간=%d 시간=%d 열차종류=%d 소요시간=%d; 나머지는 좌석 조건 확인",
+                route_dropped, time_dropped, type_dropped, duration_dropped)
     return candidates
 
 
@@ -1050,6 +1217,30 @@ def _train_type_matches(train_name: str, train_type: str) -> bool:
     if not train_name:
         return False  # 열차명 파싱 실패 row 는 오예약 방지 위해 제외
     return any(k in train_name for k in keys)
+
+
+_HHMM_RE = re.compile(r"(?<!\d)(\d{2}):(\d{2})(?!\d)")
+
+
+def _duration_minutes(text: str) -> Optional[int]:
+    """row 텍스트의 첫 두 HH:MM(출발·도착)으로 소요시간(분). 자정 넘김은 +24h. 못 읽으면 None."""
+    hhmm = _HHMM_RE.findall(text or "")
+    if len(hhmm) < 2:
+        return None
+    dep = int(hhmm[0][0]) * 60 + int(hhmm[0][1])
+    arr = int(hhmm[1][0]) * 60 + int(hhmm[1][1])
+    if arr < dep:
+        arr += 24 * 60
+    return arr - dep
+
+
+def _within_max_duration(row: dict, config: KTXAConfig) -> bool:
+    """KTXA_MAX_DURATION_MIN(분) 초과 열차 제외. 0/미설정이면 통과, 소요시간을 못 읽으면 통과(오제외 방지)."""
+    limit = getattr(config, "ktxa_max_duration_min", 0) or 0
+    if limit <= 0:
+        return True
+    dur = _duration_minutes(row.get("depart_raw", ""))
+    return dur is None or dur <= limit
 
 
 def _is_candidate_time(t: Time, config: KTXAConfig) -> bool:

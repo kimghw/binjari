@@ -130,22 +130,57 @@ _SRT_NOTIFIED: set = set()
 # 유령 좌석이 계속 검색에 잡혀도 Teams 알림은 처음 1회만, 이후엔 로그만 남긴다.
 # 예약이 실제로 성공하면 성공 알림은 별도로 나가므로 놓칠 일 없음.
 _CAND_NOTIFIED: set = set()
+# 차단 안내 없이 결과 목록을 못 읽은(SearchResultUnavailable) 연속 허용 횟수.
+# 조회 안에서 렌더 대기 + 새로고침 1회를 이미 거쳤으므로, 여기까지 연속으로 오면 중단한다.
+EMPTY_RESULT_STRIKES = 3
+# 연속 일반 예외(브라우저 소실 제외) 허용 횟수 — backoff 로 복구되지 않는 상태의 무한 반복을 막는다.
+GENERIC_ERROR_STRIKES = 10
+
+
+def _browser_lost(exc: BaseException) -> bool:
+    """CDP 대상(페이지·컨텍스트·브라우저)이 닫혀 같은 객체로는 복구할 수 없는 예외인지.
+
+    2026-11-06 18:25 실측: Chrome 이 닫힌 뒤 TargetClosedError 를 일반 예외로 무한 backoff 재시도함.
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    return any(s in text for s in (
+        "TargetClosedError", "has been closed", "Target closed", "Connection closed",
+        "browser has been closed",
+    ))
 
 # 이번 실행에서 이미 예약(hold/발권/예약대기)을 확보한 출발시각.
 # KTXA_TIMES 가 여러 개면 전부 확보할 때까지 감시를 계속하고,
 # 확보 건수가 감시 대상 수(len(ktxa_times)) 에 도달하면 종료한다.
 _RESERVED_DEPARTS: set = set()
+# 확보 건수. 같은 열차 모드에서는 출발시각이 겹쳐 set 크기로 셀 수 없어 따로 센다.
+_RESERVED_COUNT: int = 0
+# KTXA_RESERVE_SAME_TRAIN=true 일 때 첫 건이 잡힌 출발시각 — 이후 후보는 이 열차로만 좁힌다.
+_SAME_TRAIN_DEPART: str | None = None
 
 
 def _mark_reserved(config: KTXAConfig, depart: str, notifier) -> bool:
     """확보 기록 후, 목표 도달 여부(=종료 여부) 반환.
 
     목표는 KTXA_RESERVE_LIMIT (기본 1 = 여러 대 중 아무거나 1건 잡으면 종료,
-    0 = 선택한 열차 전부).
+    0 = 선택한 열차 전부). KTXA_RESERVE_SAME_TRAIN=true 면 첫 건이 잡힌 열차에서
+    LIMIT 건을 모두 잡아야 종료한다 (동행자용).
     """
+    global _RESERVED_COUNT, _SAME_TRAIN_DEPART
     _RESERVED_DEPARTS.add(depart)
-    n_times = len(config.ktxa_times)
+    _RESERVED_COUNT += 1
     limit = config.ktxa_reserve_limit
+    if config.ktxa_reserve_same_train:
+        if _SAME_TRAIN_DEPART is None:
+            _SAME_TRAIN_DEPART = depart
+        total, got = limit, _RESERVED_COUNT
+        if got < total:
+            remaining = total - got
+            LOGGER.info("확보 %d/%d — 같은 열차(%s)에서 %d건 더 감시", got, total, depart, remaining)
+            _notify(notifier, f"📊 진행 상황: {got}/{total}건 확보 — 같은 열차({depart})에서 {remaining}건 더 감시")
+            return False
+        LOGGER.info("목표 %d건 확보 (모두 %s 열차) — 감시 종료", total, depart)
+        return True
+    n_times = len(config.ktxa_times)
     total = n_times if limit <= 0 else min(limit, n_times)
     got = len(_RESERVED_DEPARTS)
     if got < total:
@@ -170,11 +205,18 @@ def run_once(
         LOGGER.info("후보 없음 (조건에 맞는 빈자리 없음 — 전부 매진 등). 다음 iteration 진행")
         return False
 
-    # 이미 확보한 출발시각은 재시도하지 않는다 (다중 감시)
-    candidates = [c for c in candidates if c.get("depart") not in _RESERVED_DEPARTS]
-    if not candidates:
-        LOGGER.info("남은 후보 없음 (전부 확보했거나 좌석 없음). 다음 iteration 진행")
-        return False
+    if config.ktxa_reserve_same_train and _SAME_TRAIN_DEPART is not None:
+        # 같은 열차 모드: 첫 건이 잡힌 열차만 계속 노린다 (동행자 좌석)
+        candidates = [c for c in candidates if c.get("depart") == _SAME_TRAIN_DEPART]
+        if not candidates:
+            LOGGER.info("같은 열차(%s) 빈자리 없음. 다음 iteration 진행", _SAME_TRAIN_DEPART)
+            return False
+    else:
+        # 이미 확보한 출발시각은 재시도하지 않는다 (다중 감시)
+        candidates = [c for c in candidates if c.get("depart") not in _RESERVED_DEPARTS]
+        if not candidates:
+            LOGGER.info("남은 후보 없음 (전부 확보했거나 좌석 없음). 다음 iteration 진행")
+            return False
 
     # SRT 후보는 코레일 자동결제 불가 — Teams 알림만 보내고 예약 대상에서 제외
     for c in [c for c in candidates if c.get("status_kind") == "srt_link"]:
@@ -285,9 +327,11 @@ def main() -> int:
     times_str = ",".join(t.strftime("%H:%M") for t in config.ktxa_times)
     seat_label = config.ktxa_seat_class or "일반실+특실"
     LOGGER.info(
-        "Watcher booting: %s→%s on %s times=%s seat=%s train=%s mode=%s",
+        "Watcher booting: %s→%s on %s times=%s seat=%s train=%s mode=%s limit=%d%s poll=%.2f~%.2fs",
         config.ktxa_origin, config.ktxa_dest, config.ktxa_date, times_str,
-        seat_label, config.ktxa_train_type, config.ktxa_mode,
+        seat_label, config.ktxa_train_type, config.ktxa_mode, config.ktxa_reserve_limit,
+        " (모두 같은 열차로)" if config.ktxa_reserve_same_train else "",
+        config.ktxa_poll_min, config.ktxa_poll_max,
     )
 
     notifier = _build_teams_notifier(config)
@@ -326,6 +370,9 @@ def main() -> int:
 
             # 연속 차단 횟수. 정상 조회(열차 목록이 나오면)가 한 번이라도 되면 0 으로 리셋.
             block_strikes = 0
+            # 연속 '결과 없음'(차단 안내 없는 0행·부분 응답) 횟수. 정상 조회되면 0 으로 리셋.
+            empty_strikes = 0
+            generic_strikes = 0
 
             while not _STOP:
                 try:
@@ -336,6 +383,8 @@ def main() -> int:
                         LOGGER.info("조회 정상 복구 — 차단 카운터 리셋 (직전 %d회)", block_strikes)
                         _notify(notifier, f"✅ 조회 정상 복구 — 감시 계속\n{stats.summary()}")
                         block_strikes = 0
+                    empty_strikes = 0
+                    generic_strikes = 0
                     if done:
                         return 0
                     if config.ktxa_once:
@@ -373,14 +422,39 @@ def main() -> int:
                 except CaptchaDetected as e:
                     LOGGER.warning("Captcha: %s — backoff", e)
                     _sleep_with_jitter(5.0, 12.0)
-                except (QueryConditionMismatch, SearchResultUnavailable) as e:
+                except QueryConditionMismatch as e:
                     LOGGER.error("조회 검증 실패 (%s): %s — 차단으로 분류하지 않고 중단", type(e).__name__, e)
                     return 1
+                except SearchResultUnavailable as e:
+                    # 조회 안에서 렌더 대기·새로고침 1회를 거치고도 빈 목록 — 한 번으로 죽지 않고
+                    # 연속 EMPTY_RESULT_STRIKES 회까지 backoff 후 재시도한다 (차단으로 분류하지 않음).
+                    empty_strikes += 1
+                    if empty_strikes >= EMPTY_RESULT_STRIKES:
+                        LOGGER.error("조회 검증 실패 (%s) 연속 %d회: %s — 차단으로 분류하지 않고 중단",
+                                     type(e).__name__, empty_strikes, e)
+                        return 1
+                    if config.ktxa_once:
+                        LOGGER.error("KTXA_ONCE=true — 조회 결과 없음(%s)으로 종료: %s", type(e).__name__, e)
+                        return 1
+                    LOGGER.warning("조회 결과 없음 [%d/%d] (%s): %s — 차단 안내 없음, backoff 후 재시도",
+                                   empty_strikes, EMPTY_RESULT_STRIKES, type(e).__name__, e)
+                    _sleep_with_jitter(5.0, 12.0)
                 except SiteLayoutChanged as e:
                     LOGGER.error("Site layout changed: %s", e)
                     return 1
                 except Exception as e:
-                    LOGGER.warning("iteration 일시 예외 (%s: %s) — backoff 후 재시도", type(e).__name__, e)
+                    if _browser_lost(e):
+                        # 같은 CDP 객체로는 복구 불가 — 종료해서 상위(웹서버 AI 복구)가 새로 띄우게 한다
+                        LOGGER.error("브라우저 연결 소실 (%s: %s) — 감시 종료", type(e).__name__, e)
+                        return 1
+                    generic_strikes += 1
+                    if config.ktxa_once or generic_strikes >= GENERIC_ERROR_STRIKES:
+                        LOGGER.error("iteration 예외 연속 %d회 (%s: %s) — %s", generic_strikes,
+                                     type(e).__name__, e,
+                                     "KTXA_ONCE=true 종료" if config.ktxa_once else "중단")
+                        return 1
+                    LOGGER.warning("iteration 일시 예외 [%d/%d] (%s: %s) — backoff 후 재시도",
+                                   generic_strikes, GENERIC_ERROR_STRIKES, type(e).__name__, e)
                     _sleep_with_jitter(5.0, 12.0)
     finally:
         # 어떤 경로로 끝나든(예약 성공/차단 중단/예외) 집계는 남긴다.

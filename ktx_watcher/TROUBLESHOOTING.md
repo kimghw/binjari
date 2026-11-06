@@ -118,6 +118,36 @@ CDP 연결 / Chrome 환경 트러블은 [WORKFLOW.md §3-1](WORKFLOW.md#3-1-cdp-
 
 ---
 
+## 15. reload·탭·재조회 직후 0행 — 목록이 그려지기 전에 읽음 (2026-11-06) ✓
+- 증상: `조회 검증 실패 (SearchResultUnavailable): No train rows ... (no-data marker=False);
+  no explicit guard notice was found` 로 워처 rc=1 종료 → 웹서버 AI 복구가 재시작 2회를 다 쓰고 멈춤.
+  18:05 KTX 탭 클릭 직후, 18:06 reload 직후, 18:07 가드 재조회 직후 — 세 번 모두 차단 안내도
+  `.tck_confirm_no-data` 마커도 없이 0행. 직전 조회는 10행 정상.
+- 원인: `networkidle` + 고정 대기(0.8~2.5s) 뒤에 바로 `li.tckList` 를 읽는데, React 가 목록을
+  다시 그리기 전이면 0행. 사용자 관찰("초기 응답이 비면 refresh 하면 정상")과 같은 현상.
+- 조치: `_wait_result_list` — 행·마커·모달 중 하나가 DOM 에 뜰 때까지 최대 10s 페이지 내 폴링
+  (submit·탭 클릭·가드 재조회 뒤 공통). 그래도 0행이면 `_settle_rows` → `_requery_when_empty` 가
+  같은 조건으로 새로고침 1회. 새로고침으로 탭이 '전체' 로 돌아가면 `perform_search` 가 탭을 다시
+  적용(최대 3회). `main.py` 는 `SearchResultUnavailable` 을 연속 `EMPTY_RESULT_STRIKES`(3)회까지
+  backoff 후 재시도하고 그 뒤에만 중단한다(차단으로 분류하지 않음). 조건 불일치는 여전히 즉시 중단.
+- 위치: `korail/search.py:_wait_result_list`, `_settle_rows`, `_requery_when_empty`, `main.py`
+- 2026-11-06 Codex 교차 검토 반영: 대기 중 뒤늦게 뜬 가드 모달은 `_await_result` 가 기록·분류한다
+  (19:55 실측: -8003 응답에 '열차 없음' 마커와 모달이 같이 뜸 → 마커는 **보일 때만**, 모달이 최우선).
+  새로고침 재조회는 `perform_search` 한 번당 1회 예산(`budget`). 탭 'active' 는 `aria-pressed` 로
+  판정(19:55 운영 로그의 Playwright call log 에서 확인). 고정 대기가 "부족"했던 게 아니라 "완료를
+  보장하지 못한" 것이며, 모달 없는 서버 FAIL 등 다른 원인도 같은 경로로 복구되지만 구분은 못 한다.
+
+## 16. 브라우저 소실 무한 재시도 · Chrome 제어권 충돌 (2026-11-06) ✓
+- 증상 1: CLI 로 돌린 검증 워처가 웹 워처의 Chrome(9444)에 "이미 살아있음 → 재사용" 으로 붙어
+  같은 페이지를 조작 → 웹 워처가 `SiteLayoutChanged(수서 선택 요소 미발견)` 로 죽고 AI 복구 1회 소모.
+- 증상 2: 상대가 Chrome 을 닫자 CLI 워처는 `TargetClosedError` 를 일반 예외로 무한 backoff 재시도
+  (ONCE 모드도 성공 경로에서만 종료 판단).
+- 조치: `chrome_launcher.py` 제어권 잠금 — 프로필 폴더의 `ktx_watcher_cdp_<port>.owner` 에 pid 기록,
+  살아있는 python 프로세스가 주인이면 `ensure_running` 이 RuntimeError 로 거부(웹서버의 일회성 조회도
+  워처가 도는 동안은 거부된다 — 의도). `main.py`: 브라우저 소실 예외는 즉시 rc=1(웹서버 AI 복구가
+  새로 띄움), 일반 예외 연속 10회 또는 ONCE 모드면 종료.
+
+
 # 참조
 
 - 환경/CDP 트러블: [WORKFLOW.md §3-1](WORKFLOW.md#3-1-cdp--chrome-환경-troubleshooting-1-7-통합)

@@ -82,6 +82,7 @@
 | `KTXA_TIMES` | 우선 시각 (HH:MM, 콤마) | `14:00,15:00` |
 | `KTXA_TIME_WINDOW` | 허용 시간대 (start,end) | `14:00,16:00` |
 | `KTXA_TOLERANCE_MIN` | 시각 매칭 허용 오차(분) | `60` |
+| `KTXA_MAX_DURATION_MIN` | 소요시간 상한(분), 초과 열차 제외 (0=제한 없음) | `180` |
 | `KTXA_TRAIN_TYPE` | 열차 종류 필터 | `KTX` |
 | `KTXA_SEAT_CLASS` | 좌석 등급 | `일반실` |
 | `KTXA_MODE` | `search` 또는 `reserve` | `reserve` |
@@ -138,7 +139,8 @@
 매칭 실패 시 첫 번째 가용 좌석으로 대체하지 않는다.
 
 명시적 차단은 `GuardBlocked`, 조회 조건 불일치는 `QueryConditionMismatch`,
-빈 목록·불완전 목록은 `SearchResultUnavailable`로 구분한다.
+빈 목록·불완전 목록은 `SearchResultUnavailable`로 구분한다 — 목록 렌더 대기(최대 10s)와
+같은 조건 새로고침 1회 뒤에도 비어 있을 때만 올라오고, 워처는 연속 3회까지 backoff 후 재시도한다.
 차단 화면·문구는 dismiss 전에 `runs/guards/`에 저장하며,
 `python -m ktx_watcher.diagnose`는 예약 없이 실제 조회 기록을 남긴다.
 

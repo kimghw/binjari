@@ -29,8 +29,11 @@ def read_page_state(page: Page, *, inputs: dict[str, str] | None = None,
                 texts: Object.fromEntries(Object.entries(texts).map(
                     ([key, sel]) => [key, document.querySelector(sel)?.textContent?.trim() ?? null])),
                 tab: activeTab ? {
+                    // 코레일 결과 페이지의 열차종류 탭은 aria-pressed 로 활성 표시
+                    // (2026-11-06 19:55 운영 로그의 Playwright call log: <button aria-pressed="true" ...>)
                     active: /active|current/i.test(activeTab.className) ||
-                        activeTab.getAttribute('aria-selected') === 'true'
+                        activeTab.getAttribute('aria-selected') === 'true' ||
+                        activeTab.getAttribute('aria-pressed') === 'true'
                 } : null
             };
         }""",

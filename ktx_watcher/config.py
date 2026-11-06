@@ -65,9 +65,14 @@ class KTXAConfig(BaseModel):
     # true 면 검색 시 "서울·용산 - 수서 함께 보기" 옵션을 켠다 (수서 발착 SRT 포함; 2026-11 SRT 는 KTX 탭에 통합)
     ktxa_include_srt: bool = Field(False, alias="KTXA_INCLUDE_SRT")
     ktxa_tolerance_min: int = Field(0, alias="KTXA_TOLERANCE_MIN")
+    # 소요시간 상한(분). 출발→도착이 이보다 오래 걸리는 열차(경유 등)는 후보에서 제외. 0 = 제한 없음.
+    ktxa_max_duration_min: int = Field(0, alias="KTXA_MAX_DURATION_MIN")
     # 확보 목표 건수: 감시 시각(열차) 중 몇 건을 예약하면 종료할지.
     # 1 = 아무거나 1건(기본), 0 = 선택한 열차 전부.
     ktxa_reserve_limit: int = Field(1, alias="KTXA_RESERVE_LIMIT")
+    # true 면 확보 목표(2건 이상)를 모두 같은 열차로 잡는다 — 첫 건이 잡힌 열차에서
+    # 나머지 좌석을 계속 노림 (동행자용: 취소표는 한 좌석씩 나와 한 번에 2석을 잡기 어렵다).
+    ktxa_reserve_same_train: bool = Field(False, alias="KTXA_RESERVE_SAME_TRAIN")
     ktxa_time_window: Optional[Tuple[time, time]] = Field(
         None, alias="KTXA_TIME_WINDOW"
     )
@@ -77,8 +82,9 @@ class KTXAConfig(BaseModel):
     ktxa_pass: str = Field("", alias="KTXA_PASS")
 
     # ─ Polling ─
-    ktxa_poll_min: int = Field(3, alias="KTXA_POLL_MIN")
-    ktxa_poll_max: int = Field(10, alias="KTXA_POLL_MAX")
+    # 초 단위, 소수 허용 (예: 0.5). 조회 사이 유휴 대기 범위 [min, max] 에서 매번 무작위.
+    ktxa_poll_min: float = Field(3, alias="KTXA_POLL_MIN")
+    ktxa_poll_max: float = Field(10, alias="KTXA_POLL_MAX")
     ktxa_once: bool = Field(False, alias="KTXA_ONCE")
     # 차단(열차 목록 자체가 비어 돌아옴) 이 연속 몇 번이면 감시를 중단할지.
     # 0 이면 중단하지 않고 경고만 (권장 안 함 — 차단 중엔 폴링이 무의미).
@@ -167,7 +173,8 @@ class KTXAConfig(BaseModel):
         return s, e
 
     @field_validator("ktxa_once", "teams_enabled", "ktxa_payment_mode", "ktxa_seated_only",
-                     "ktxa_transfer_enabled", "ktxa_transfer_send", "ktxa_vdesk", mode="before")
+                     "ktxa_transfer_enabled", "ktxa_transfer_send", "ktxa_vdesk",
+                     "ktxa_reserve_same_train", mode="before")
     @classmethod
     def _parse_bool(cls, v):
         return _boolify(v)
@@ -193,6 +200,14 @@ class KTXAConfig(BaseModel):
     @classmethod
     def _seat_class_opt(cls, v):
         return (v or "").strip()
+
+    @field_validator("ktxa_max_duration_min", mode="before")
+    @classmethod
+    def _max_duration_opt(cls, v):
+        # 설정 화면이 빈값을 저장할 수 있다 → 0(제한 없음)
+        if v in ("", None):
+            return 0
+        return v
 
     @field_validator("ktxa_passenger_type", mode="after")
     @classmethod
@@ -231,6 +246,13 @@ class KTXAConfig(BaseModel):
     def _final(cls, values: "KTXAConfig"):
         if values.ktxa_reserve_limit < 0:
             raise ValueError("KTXA_RESERVE_LIMIT must be >= 0 (0=전부)")
+        if values.ktxa_reserve_same_train and values.ktxa_reserve_limit < 2:
+            raise ValueError(
+                "KTXA_RESERVE_SAME_TRAIN=true 는 KTXA_RESERVE_LIMIT 가 2 이상"
+                "(같은 열차에서 잡을 건수)일 때만 쓸 수 있습니다"
+            )
+        if values.ktxa_max_duration_min < 0:
+            raise ValueError("KTXA_MAX_DURATION_MIN must be >= 0")
         if values.ktxa_poll_min <= 0:
             raise ValueError("KTXA_POLL_MIN must be > 0")
         if values.ktxa_poll_max < values.ktxa_poll_min:

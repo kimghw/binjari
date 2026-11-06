@@ -13,6 +13,7 @@ import logging
 import os
 import socket
 import subprocess
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -84,6 +85,28 @@ def _cdp_alive(port: int, retries: int = 2, http_timeout: float = 5.0) -> bool:
     return False
 
 
+def _pid_is_watcher(pid: int) -> bool:
+    """pid 가 살아있는 python 프로세스인지 (제어권 잠금 파일의 주인이 아직 도는지)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, errors="replace", timeout=5,
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
+            ).stdout
+        except Exception:
+            return False
+        first = out.strip().splitlines()[0] if out.strip() else ""
+        return first.startswith('"') and "python" in first.lower()
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 class ChromeLauncher:
     """chrome.exe 를 디버그 모드로 띄우고 lifecycle 을 관리.
 
@@ -113,6 +136,7 @@ class ChromeLauncher:
         self.vdesk_name = vdesk_name
         self._proc: Optional[subprocess.Popen] = None  # watcher 가 띄운 경우만 set
         self._reused_existing = False
+        self._owner_lock: Optional[Path] = None
 
     @staticmethod
     def _find_chrome_exe() -> str:
@@ -130,10 +154,12 @@ class ChromeLauncher:
     def ensure_running(self) -> str:
         """Chrome 디버그 인스턴스가 살아있도록 보장. CDP URL 반환."""
         if _cdp_alive(self.port):
+            self._claim_control()   # 다른 워처가 제어 중이면 여기서 RuntimeError
             LOGGER.info("Chrome 디버그 인스턴스 이미 살아있음: port=%d (재사용)", self.port)
             self._reused_existing = True
             self._move_to_vdesk()
             return self.cdp_url
+        self._claim_control()
 
         args = [
             self.exe_path,
@@ -203,18 +229,63 @@ class ChromeLauncher:
             if r.returncode == 0:
                 LOGGER.info("Chrome 창 가상 데스크톱 이동: %s", out)
                 return
-            if r.returncode == 4:  # 창이 아직 안 뜸 → 재시도
-                time.sleep(1.0)
+            if r.returncode == 4:  # 창이 아직 안 뜸 / 이동 실패("요소가 없습니다" 등) → 재시도
+                LOGGER.warning("vdesk 이동 재시도 [%d/3]: %s", attempt + 1, out)
+                time.sleep(2.0)
                 continue
             LOGGER.warning(
                 "vdesk 이동 skip (exit=%d): %s %s",
                 r.returncode, out, (r.stderr or "").strip()[:200],
             )
             return
-        LOGGER.warning("vdesk 이동 포기: Chrome 창을 찾지 못함 (port=%d)", self.port)
+        LOGGER.warning(
+            "vdesk 이동 포기 — Chrome 창이 사용자 데스크톱에 남아 있을 수 있음 (port=%d)", self.port
+        )
+
+    # ── 제어권 잠금 ────────────────────────────────────────────────────
+    # 같은 디버그 포트의 Chrome 에 워처가 둘 붙으면 한쪽이 다른 쪽 페이지를 조작해 깨진다
+    # (2026-11-06 18:25 실측: CLI 검증 실행이 웹 워처의 Chrome 에 '재사용' 으로 붙어 웹 워처가 죽음).
+    # 제어 중인 프로세스 pid 를 프로필 폴더의 잠금 파일에 남기고, 살아있는 다른 워처가 있으면 거부한다.
+
+    def _lock_path(self) -> Path:
+        base = self.user_data_dir or Path(tempfile.gettempdir())
+        return base / f"ktx_watcher_cdp_{self.port}.owner"
+
+    def _claim_control(self) -> None:
+        path = self._lock_path()
+        try:
+            raw = path.read_text(encoding="utf-8").strip() if path.exists() else ""
+        except Exception:
+            raw = ""
+        if raw.isdigit() and int(raw) != os.getpid() and _pid_is_watcher(int(raw)):
+            raise RuntimeError(
+                f"다른 워처(pid={raw})가 Chrome 디버그 포트 {self.port} 를 제어 중입니다 — "
+                "동시에 붙으면 상대 조회가 깨집니다. 그 워처를 먼저 중지하거나 KTXA_CDP_PORT 를 바꾸세요."
+            )
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(str(os.getpid()), encoding="utf-8")
+            self._owner_lock = path
+        except Exception as e:
+            LOGGER.warning("제어권 잠금 파일 기록 실패 (계속 진행): %s", e)
+
+    def _release_control(self) -> None:
+        path, self._owner_lock = self._owner_lock, None
+        if path is None:
+            return
+        try:
+            if path.exists() and path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                path.unlink()
+        except Exception as e:
+            LOGGER.debug("제어권 잠금 해제 실패: %s", e)
+
+    def release_control(self) -> None:
+        """잠금만 해제 (Chrome 은 그대로). 수명을 관리하지 않는 일회성 호출자(웹서버 시간표 조회)용."""
+        self._release_control()
 
     def shutdown_if_owned(self) -> None:
-        """watcher 가 띄운 인스턴스만 종료. 사용자가 띄운 건 건드리지 않음."""
+        """watcher 가 띄운 인스턴스만 종료. 사용자가 띄운 건 건드리지 않음. 제어권 잠금은 항상 해제."""
+        self._release_control()
         if self._reused_existing or self._proc is None:
             return
         try:

@@ -22,7 +22,7 @@ from ktx_watcher.browser import sync_playwright
 from ktx_watcher.dom import read_page_state, first_visible
 import sys
 
-with tempfile.TemporaryDirectory() as profile:
+with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as profile:
     proc = subprocess.Popen([
         CHROME, '--headless=new', '--remote-debugging-port=0',
         '--user-data-dir=' + profile, '--no-first-run', 'about:blank',

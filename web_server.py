@@ -59,7 +59,7 @@ SETTINGS_KEYS = [
     "PAY_CARD_PW2", "PAY_ID6", "PAY_CARD_COMPANY",
     # 여정
     "KTXA_ORIGIN", "KTXA_DEST", "KTXA_DATE", "KTXA_TIMES",
-    "KTXA_TOLERANCE_MIN", "KTXA_TIME_WINDOW", "KTXA_RESERVE_LIMIT",
+    "KTXA_TOLERANCE_MIN", "KTXA_MAX_DURATION_MIN", "KTXA_TIME_WINDOW", "KTXA_RESERVE_LIMIT", "KTXA_RESERVE_SAME_TRAIN",
     "KTXA_PASSENGERS", "KTXA_PASSENGER_TYPE",
     "KTXA_SEAT_CLASS", "KTXA_SEATED_ONLY", "KTXA_TRAIN_NO",
     "KTXA_TRAIN_TYPE", "KTXA_INCLUDE_SRT",
@@ -188,6 +188,7 @@ class SearchRequest(BaseModel):
     date: str = Field(..., description="YYYY-MM-DD")
     earliest_hour: int = Field(6, ge=0, le=23, description="조회 시작 시각 (시)")
     latest_hour: Optional[int] = Field(None, ge=1, le=24, description="조회 종료 시각 (정각까지 포함, 없으면 제한 없음)")
+    max_duration_min: Optional[int] = Field(None, ge=1, le=1440, description="소요시간 상한(분). 출발→도착이 이보다 오래 걸리는 열차 제외, 없으면 제한 없음")
     train_no: str = Field("", description="열차번호로 필터 (예: 101, 비우면 전체)")
     passengers: int = Field(1, ge=1, le=9)
     force: bool = Field(False, description="true 면 캐시 무시하고 사이트 재조회")
@@ -217,6 +218,7 @@ def _build_ktxa_config(req: SearchRequest) -> KTXAConfig:
         "KTXA_SEATED_ONLY": "false",
         "KTXA_TIME_WINDOW": "",
         "KTXA_TOLERANCE_MIN": "1440",
+        "KTXA_MAX_DURATION_MIN": "0",
         "KTXA_MODE": "search",
         "TEAMS_ENABLED": "false",
     })
@@ -257,7 +259,15 @@ def _live_fetch(config: KTXAConfig) -> List[Dict[str, Any]]:
         vdesk=config.ktxa_vdesk,
     )
     cdp_url = launcher.ensure_running()
-    # Chrome 은 재사용을 위해 종료하지 않는다 (워처와 동일 정책)
+    # Chrome 은 재사용을 위해 종료하지 않는다 (워처와 동일 정책). 제어권 잠금은 조회가 끝나면
+    # 바로 푼다 — 안 풀면 웹서버 pid 가 주인으로 남아 다음 '감시 시작' 이 거부된다.
+    try:
+        return _live_fetch_rows(cdp_url, config)
+    finally:
+        launcher.release_control()
+
+
+def _live_fetch_rows(cdp_url: str, config: KTXAConfig) -> List[Dict[str, Any]]:
     with KorailSPAClient(cdp_url) as client:
         page = ktx_search.navigate_to_search(client)
         ktx_search.fill_search_form(page, config)
@@ -307,6 +317,42 @@ def _cache_save(cache: Dict[str, Any]) -> None:
 def _dep_minutes(row: Dict[str, Any]) -> Optional[int]:
     m = re.fullmatch(r"(\d{2}):(\d{2})", row.get("depart", ""))
     return int(m.group(1)) * 60 + int(m.group(2)) if m else None
+
+
+def _duration_minutes(row: Dict[str, Any]) -> Optional[int]:
+    """출발·도착(HH:MM)으로 소요시간(분). 자정 넘김은 +24h. 못 읽으면 None."""
+    dep = _dep_minutes(row)
+    m = re.fullmatch(r"(\d{2}):(\d{2})", row.get("arrive", "") or "")
+    if dep is None or not m:
+        return None
+    arr = int(m.group(1)) * 60 + int(m.group(2))
+    if arr < dep:
+        arr += 24 * 60
+    return arr - dep
+
+
+def _filter_rows(rows_all: List[Dict[str, Any]], req: SearchRequest, now: datetime) -> List[Dict[str, Any]]:
+    """요청 범위 필터: 시간대·소요시간 상한·열차번호, 오늘이면 지난 시각 제외."""
+    want_no = req.train_no.strip().lstrip("0")
+    cur = now.hour * 60 + now.minute if req.date == now.date().isoformat() else None
+    rows: List[Dict[str, Any]] = []
+    for r in rows_all:
+        minutes = _dep_minutes(r)
+        if minutes is not None:
+            if minutes < req.earliest_hour * 60:
+                continue
+            if req.latest_hour is not None and minutes > req.latest_hour * 60:
+                continue
+            if cur is not None and minutes < cur:
+                continue
+        if req.max_duration_min is not None:
+            dur = _duration_minutes(r)
+            if dur is not None and dur > req.max_duration_min:
+                continue
+        if want_no and r.get("train_no", "").lstrip("0") != want_no:
+            continue
+        rows.append(r)
+    return rows
 
 
 def _cache_purge(cache: Dict[str, Any]) -> None:
@@ -379,27 +425,13 @@ def _ktx_list_schedules(req: SearchRequest) -> Dict[str, Any]:
             }
             _cache_save(cache)
 
-    # 요청 범위 필터 (시간대·열차번호·오늘이면 지난 시각 제외)
-    want_no = req.train_no.strip().lstrip("0")
-    now = datetime.now()
-    cur = now.hour * 60 + now.minute if req.date == now.date().isoformat() else None
-    rows: List[Dict[str, Any]] = []
-    for r in rows_all:
-        minutes = _dep_minutes(r)
-        if minutes is not None:
-            if minutes < req.earliest_hour * 60:
-                continue
-            if req.latest_hour is not None and minutes > req.latest_hour * 60:
-                continue
-            if cur is not None and minutes < cur:
-                continue
-        if want_no and r.get("train_no", "").lstrip("0") != want_no:
-            continue
-        rows.append(r)
+    # 요청 범위 필터 (시간대·소요시간 상한·열차번호·오늘이면 지난 시각 제외)
+    rows = _filter_rows(rows_all, req, datetime.now())
 
-    LOGGER.info("KTX 결과 %d건 (%s, 필터: %02d시~%s, 열차번호=%s)",
+    LOGGER.info("KTX 결과 %d건 (%s, 필터: %02d시~%s, 소요시간≤%s, 열차번호=%s)",
                 len(rows), "캐시" if usable else "실조회", req.earliest_hour,
                 f"{req.latest_hour:02d}시" if req.latest_hour is not None else "무제한",
+                f"{req.max_duration_min}분" if req.max_duration_min is not None else "무제한",
                 req.train_no or "전체")
     return {"rows": rows, "cached": usable, "fetched_at": fetched_at}
 
@@ -769,8 +801,15 @@ button {
   grid-column: span 2;
 }
 
+.time-cell .dur {
+  font-size: .78em;
+  opacity: .72;
+  margin-left: 4px;
+  white-space: nowrap;
+}
 .time-start-field,
-.time-end-field {
+.time-end-field,
+.duration-field {
   grid-column: span 3;
 }
 
@@ -1752,6 +1791,7 @@ body #routeChips button {
   .passenger-field,
   .time-start-field,
   .time-end-field,
+  .duration-field,
   .train-number-field {
     grid-column: span 3;
   }
@@ -1827,6 +1867,7 @@ body #routeChips button {
   .passenger-field,
   .time-start-field,
   .time-end-field,
+  .duration-field,
   .train-number-field {
     grid-column: 1 / -1;
   }
@@ -1997,6 +2038,19 @@ def index() -> str:
               {''.join(f'<option value="{h}">{h:02d}:00 이전</option>' for h in range(1, 25))}
             </select>
           </div>
+          <div class="form-field duration-field">
+            <label for="q_max_duration">소요 시간</label>
+            <select name="max_duration_min" id="q_max_duration">
+              <option value="">제한 없음</option>
+              <option value="60">1시간 이내</option>
+              <option value="90">1시간 30분 이내</option>
+              <option value="120">2시간 이내</option>
+              <option value="150">2시간 30분 이내</option>
+              <option value="180">3시간 이내</option>
+              <option value="240">4시간 이내</option>
+              <option value="300">5시간 이내</option>
+            </select>
+          </div>
           <div class="form-field train-number-field">
             <label for="q_train_no">열차번호 <span class="optional">선택</span></label>
             <input name="train_no" id="q_train_no" inputmode="numeric" placeholder="예: 101">
@@ -2036,6 +2090,7 @@ function payload() {{
     date:   f.date.value,
     earliest_hour: parseInt(f.earliest_hour.value, 10),
     latest_hour:   f.latest_hour.value === '' ? null : parseInt(f.latest_hour.value, 10),
+    max_duration_min: f.max_duration_min.value === '' ? null : parseInt(f.max_duration_min.value, 10),
     train_no:      f.train_no.value.trim(),
     passengers:    parseInt(f.passengers.value, 10),
     include_srt:   true,
@@ -2117,6 +2172,19 @@ function seatTag(label, txt) {{
   return ok ? `<span class="seat-tag" title="${{escapeHtml(t)}}">${{label}}</span>` : '';
 }}
 
+function durationLabel(r) {{
+  const dep = String(r.depart || '').split(':'), arr = String(r.arrive || '').split(':');
+  if (dep.length !== 2 || arr.length !== 2) return '';
+  let mins = (parseInt(arr[0], 10) * 60 + parseInt(arr[1], 10)) - (parseInt(dep[0], 10) * 60 + parseInt(dep[1], 10));
+  if (isNaN(mins)) return '';
+  if (mins < 0) mins += 24 * 60;
+  return Math.floor(mins / 60) + '시간' + (mins % 60 ? ' ' + (mins % 60) + '분' : '');
+}}
+function durationBadge(r) {{
+  const d = durationLabel(r);
+  return d ? ` <span class="dur">${{d}}</span>` : '';
+}}
+
 function renderRows(rows) {{
   if (!rows || rows.length === 0) return '';
   window.lastRows = rows;
@@ -2129,7 +2197,7 @@ function renderRows(rows) {{
     <td><input type="checkbox" class="selrow" data-i="${{i}}" onchange="updateSelBar()"
       aria-label="${{escapeHtml(r.train_type)}} ${{escapeHtml(r.train_no)}} ${{escapeHtml(r.depart)}} 출발 선택"></td>
     <td class="train-cell"><span class="train-badge">${{escapeHtml(r.train_type)}}</span><span class="train-number">${{escapeHtml(r.train_no)}}</span></td>
-    <td class="time-cell"><div class="dep">${{escapeHtml(r.depart)}}</div><div class="arr">${{escapeHtml(r.arrive)}}</div></td>
+    <td class="time-cell"><div class="dep">${{escapeHtml(r.depart)}}</div><div class="arr">${{escapeHtml(r.arrive)}}${{durationBadge(r)}}</div></td>
     <td class="seat-cell">${{seatTag('특실', r.first) + seatTag('일반실', r.general) || '<span class="seat-none">–</span>'}}</td>
   </tr>`).join('');
   return `<div class="table-wrap"><table aria-label="조회된 열차 시간표">
@@ -2234,7 +2302,8 @@ async function search(which, force = false) {{
   if (window.recordTrip) window.recordTrip(body.origin, body.dest);
   localStorage.setItem('binjari_query', JSON.stringify({{
     origin: body.origin, dest: body.dest, date: body.date,
-    earliest_hour: body.earliest_hour, latest_hour: body.latest_hour, ts: Date.now(),
+    earliest_hour: body.earliest_hour, latest_hour: body.latest_hour,
+    max_duration_min: body.max_duration_min, ts: Date.now(),
   }}));
   status.textContent = force
     ? '최신 시간표를 확인하고 있어요. 약 15초 정도 걸릴 수 있습니다.'
@@ -2308,6 +2377,7 @@ async function initFormFromSettings() {{
         syncLatestOptions();
       }}
       f.latest_hour.value = (q.latest_hour === null || q.latest_hour === undefined) ? '' : String(q.latest_hour);
+      f.max_duration_min.value = (q.max_duration_min === null || q.max_duration_min === undefined) ? '' : String(q.max_duration_min);
       return;
     }}
     const r = await fetch('/api/settings');
@@ -2328,6 +2398,10 @@ async function initFormFromSettings() {{
       const endH = Math.min(parseInt(m2[1], 10) + (parseInt(m2[2], 10) > 0 ? 1 : 0), 24);
       if (endH > parseInt(f.earliest_hour.value, 10)) f.latest_hour.value = String(endH);
     }}
+    const md = parseInt(v.KTXA_MAX_DURATION_MIN || '0', 10);
+    if (md > 0 && [...f.max_duration_min.options].some(o => o.value === String(md))) {{
+      f.max_duration_min.value = String(md);
+    }}
   }} catch (e) {{ /* 초기값 유지 */ }}
 }}
 initFormFromSettings();
@@ -2345,6 +2419,7 @@ window.applyChatUpdates = function (u, action) {{
     syncLatestOptions();
   }}
   if (u.latest_hour !== undefined) f.latest_hour.value = u.latest_hour === '' ? '' : String(parseInt(u.latest_hour, 10));
+  if (u.max_duration_min !== undefined) f.max_duration_min.value = (u.max_duration_min === '' || u.max_duration_min === null) ? '' : String(parseInt(u.max_duration_min, 10));
   if (u.train_no !== undefined) f.train_no.value = u.train_no;
   if (u.passengers !== undefined && u.passengers !== '') f.passengers.value = String(parseInt(u.passengers, 10));
   if (action === 'search') search('ktx');
@@ -2464,6 +2539,18 @@ SETTINGS_HTML = """
           <input id="KTXA_TOLERANCE_MIN" type="number" class="short" min="0"
                  onchange="renderTimes()"></div>
         <span class="hint">허용 오차: 각 감시 시각 ±N분 안에 출발하는 열차까지 후보로 봅니다.</span>
+        <div class="field"><label>최대 소요시간</label>
+          <select id="KTXA_MAX_DURATION_MIN" class="short">
+            <option value="0">제한 없음</option>
+            <option value="60">1시간 이내</option>
+            <option value="90">1시간 30분 이내</option>
+            <option value="120">2시간 이내</option>
+            <option value="150">2시간 30분 이내</option>
+            <option value="180">3시간 이내</option>
+            <option value="240">4시간 이내</option>
+            <option value="300">5시간 이내</option>
+          </select></div>
+        <span class="hint">최대 소요시간: 출발→도착이 이보다 오래 걸리는 열차(경유 등)는 감시 후보에서 뺍니다.</span>
       </div>
     </details>
     <datalist id="stations"></datalist>  <!-- /common.js 가 실제 코레일 역 목록으로 채움 -->
@@ -2528,8 +2615,13 @@ SETTINGS_HTML = """
           <option value="0">선택한 열차 전부</option>
         </select></div>
     </div>
+    <div class="row">
+      <label class="check" id="sameTrainWrap" title="첫 건이 잡힌 열차에서 나머지 좌석을 계속 노립니다 — 동행자와 같은 열차를 타야 할 때 (취소표는 한 좌석씩 나오므로)">
+        <input type="checkbox" id="KTXA_RESERVE_SAME_TRAIN">모두 같은 열차로 — 첫 건이 잡힌 열차에서 나머지도 확보 (확보 목표 2건 이상일 때)</label>
+    </div>
     <p class="hint">예약까지: 취소표가 나오면 예약만 잡아둡니다 (결제는 직접).
       결제·발권까지: 예약 후 등록된 카드로 자동 결제·발권합니다.
+      '모두 같은 열차로'를 켜면 첫 건은 선택한 열차 중 아무거나, 나머지는 그 열차에서만 잡습니다 (동행자용).
       로그인·카드 정보는 ⚙ 환경 설정 탭에서 입력하세요.</p>
   </section>
 
@@ -2592,8 +2684,8 @@ SETTINGS_HTML = """
       <label class="check"><input type="checkbox" id="KTXA_ONCE">1회만 실행</label>
     </div>
     <div class="row">
-      <div class="field"><label>폴링 최소 (초)</label><input id="KTXA_POLL_MIN" type="number" class="short" min="1"></div>
-      <div class="field"><label>폴링 최대 (초)</label><input id="KTXA_POLL_MAX" type="number" class="short" min="1"></div>
+      <div class="field"><label>폴링 최소 (초)</label><input id="KTXA_POLL_MIN" type="number" class="short" min="0.1" step="0.1"></div>
+      <div class="field"><label>폴링 최대 (초)</label><input id="KTXA_POLL_MAX" type="number" class="short" min="0.1" step="0.1"></div>
       <div class="field"><label>로그 폴더</label><input id="KTXA_LOG_DIR" class="mid"></div>
       <div class="field"><label>로그 레벨</label>
         <select id="KTXA_LOG_LEVEL"><option>DEBUG</option><option>INFO</option>
@@ -2661,7 +2753,7 @@ SETTINGS_HTML = """
 <script>
 const PAX_TYPES = ['어른','어린이','유아','경로','중증장애인','경증장애인','국가유공자'];
 const TEXT_IDS = [
-  'KTXA_ORIGIN','KTXA_DEST','KTXA_DATE','KTXA_TOLERANCE_MIN','KTXA_RESERVE_LIMIT',
+  'KTXA_ORIGIN','KTXA_DEST','KTXA_DATE','KTXA_TOLERANCE_MIN','KTXA_MAX_DURATION_MIN','KTXA_RESERVE_LIMIT',
   'KTXA_TRAIN_TYPE','KTXA_TRAIN_NO',
   'KTXA_USER','KTXA_PASS',
   'PAY_CARD_NUM','PAY_CARD_MM','PAY_CARD_YY','PAY_CARD_PW2','PAY_ID6','PAY_CARD_COMPANY',
@@ -2674,9 +2766,49 @@ const TEXT_IDS = [
 ];
 const BOOL_IDS = [
   'KTXA_SEATED_ONLY','KTXA_INCLUDE_SRT','KTXA_TRANSFER_ENABLED','KTXA_TRANSFER_SEND',
-  'KTXA_HUMANIZE','KTXA_ONCE','TEAMS_ENABLED','KTXA_VDESK',
+  'KTXA_HUMANIZE','KTXA_ONCE','TEAMS_ENABLED','KTXA_VDESK','KTXA_RESERVE_SAME_TRAIN',
 ];
 let times = [];   // ['09:00', ...]
+
+// 확보 목표가 2건 이상일 때만 '모두 같은 열차로' 를 켤 수 있다 (1건/전부에서는 의미 없음)
+function syncSameTrain() {
+  const limit = parseInt(document.getElementById('KTXA_RESERVE_LIMIT').value, 10);
+  const st = document.getElementById('KTXA_RESERVE_SAME_TRAIN');
+  const ok = limit >= 2;
+  st.disabled = !ok;
+  if (!ok) st.checked = false;
+  document.getElementById('sameTrainWrap').style.opacity = ok ? '' : '0.5';
+}
+
+// ── 출발 시각 기억: 지난번 입력한 출발 시각을 다음에 열 때 초기값으로 (매번 09:00 으로 돌아가지 않게) ──
+const START_KEY = 'binjari_settings_start';
+function rememberStart() {
+  try {
+    localStorage.setItem(START_KEY, JSON.stringify({
+      hour: document.getElementById('addHour').value,
+      min: document.getElementById('addMin').value,
+      ts: Date.now(),
+    }));
+  } catch (e) { /* localStorage 를 못 쓰는 환경이면 무시 */ }
+}
+function restoreStart(v, tw) {
+  const hourSel = document.getElementById('addHour');
+  const minSel = document.getElementById('addMin');
+  let s = null;
+  try { s = JSON.parse(localStorage.getItem(START_KEY) || 'null'); } catch (e) {}
+  if (s && s.hour !== undefined && s.hour !== '') {
+    hourSel.value = s.hour;
+    minSel.value = s.min || '00';
+    if (hourSel.value === s.hour) return;   // 옵션에 있는 값이면 끝
+  }
+  // 기억된 값이 없으면(다른 브라우저 등) 저장된 감시 시각의 첫 시각을 10분 단위로 내려 쓴다
+  const first = ((tw && tw[0]) || (v.KTXA_TIMES || '').split(',')[0] || '').trim();
+  const m = /^(\\d{2}):(\\d{2})$/.exec(first);
+  if (m) {
+    hourSel.value = m[1];
+    minSel.value = String(Math.floor(parseInt(m[2], 10) / 10) * 10).padStart(2, '0');
+  }
+}
 
 // ── 초기 위젯 구성 ──
 (function initWidgets() {
@@ -2705,6 +2837,7 @@ let times = [];   // ['09:00', ...]
   }
   document.getElementById('pax_어른').value = 1;   // 기본 어른 1명
   grid.addEventListener('change', updatePaxSummary);
+  document.getElementById('KTXA_RESERVE_LIMIT').addEventListener('change', syncSameTrain);
   document.querySelectorAll('.field').forEach(field => {
     const label = field.querySelector(':scope > label');
     const control = field.querySelector(':scope > input[id], :scope > select[id], :scope > .pwwrap input[id]');
@@ -2831,6 +2964,7 @@ async function loadRangeTrains(force) {
   const sh = parseInt(document.getElementById('addHour').value, 10);
   const sm = parseInt(document.getElementById('addMin').value, 10);
   const twN = document.getElementById('TW_HOURS').value;
+  rememberStart();
   const startMin = sh * 60 + sm;
   const endMin = twN === '' ? 24 * 60 - 1 : Math.min(startMin + parseInt(twN, 10) * 60, 24 * 60 - 1);
   setStatus('', force ? '사이트 재조회 중... (~30초)' : '열차 조회 중... (저장된 시간표 있으면 즉시, 없으면 ~30초)');
@@ -2917,6 +3051,9 @@ async function load() {
     const el = document.getElementById(id);
     if (el) el.value = clean(v[id] || '');
   }
+  // 최대 소요시간 select: 값이 없거나 선택지에 없으면 '제한 없음'(0)
+  const mdSel = document.getElementById('KTXA_MAX_DURATION_MIN');
+  if (mdSel && !mdSel.value) mdSel.value = '0';
   for (const id of BOOL_IDS) {
     const el = document.getElementById(id);
     if (el) el.checked = /^(1|true|yes|y|on)$/i.test(v[id] || '');
@@ -2935,9 +3072,12 @@ async function load() {
     if (hrs >= 1 && hrs <= 12) twSel = String(hrs);
   }
   document.getElementById('TW_HOURS').value = twSel;
+  // 출발 시각: 지난번 입력값 → 없으면 저장된 감시 시각의 첫 시각
+  restoreStart(v, tw);
   // 확보 목표: 값 없으면 기본 1건
   const rl = document.getElementById('KTXA_RESERVE_LIMIT');
   if (!rl.value) rl.value = '1';
+  syncSameTrain();
   // 좌석 등급 / 승객 / 실행 범위
   setSeat(clean(v.KTXA_SEAT_CLASS || ''));
   setPax(clean(v.KTXA_PASSENGER_TYPE) || '어른', parseInt(v.KTXA_PASSENGERS || '1', 10) || 1);
@@ -3031,6 +3171,7 @@ async function save() {
     }
     formDirty = false;
     localStorage.setItem('binjari_saved_ts', String(Date.now()));
+    rememberStart();
     return true;
   } catch (e) {
     setStatus('err', '저장 실패: ' + e.message);
@@ -3168,6 +3309,7 @@ window.applyChatUpdates = function (u, action) {
     setPax(u.KTXA_PASSENGER_TYPE || cur.KTXA_PASSENGER_TYPE,
            parseInt(u.KTXA_PASSENGERS || cur.KTXA_PASSENGERS, 10) || 1);
   }
+  syncSameTrain();
   formDirty = true;
   if (action === 'save') save();
 };
@@ -3264,11 +3406,20 @@ def _start_watcher_proc() -> Dict[str, Any]:
     logf.write(f"\n===== 웹에서 감시 시작 {datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
     logf.flush()
     creation = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    # 부모(웹서버) 환경에 KTXA_* 등이 있으면 자식이 상속해 .env.ktx 값을 덮어쓴다
+    # (config 의 load_dotenv 는 override=False) → 설정 파일이 항상 이기도록 해당 접두사 키를 뺀다.
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("KTXA_", "TEAMS_", "PAY_", "AZURE_", "DB_"))}
+    # 서버가 터미널 밖(서비스/WMI 등)에서 떴으면 UTF-8 환경변수가 없어 자식 로그 한글이 cp949 로 깨진다
+    # (2026-11-06 실측) → 자식은 항상 UTF-8 모드로.
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     proc = subprocess.Popen(
         [sys.executable, "-m", "ktx_watcher.main"],
         stdout=logf, stderr=subprocess.STDOUT,
         cwd=str(Path(__file__).resolve().parent),
         creationflags=creation,
+        env=env,
     )
     old_logf = _WATCHER.get("logf")
     if old_logf:
@@ -3439,7 +3590,7 @@ SECRET_KEYS = {
     "KTXA_TRANSFER_MEMBER_NO", "KTXA_TRANSFER_PHONE",
     "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET", "AZURE_TENANT_ID",
 }
-SEARCH_FIELDS = {"origin", "dest", "date", "earliest_hour", "latest_hour", "train_no", "passengers"}
+SEARCH_FIELDS = {"origin", "dest", "date", "earliest_hour", "latest_hour", "max_duration_min", "train_no", "passengers"}
 
 
 class ChatRequest(BaseModel):
@@ -3457,6 +3608,7 @@ def _chat_context(tab: str) -> str:
 updates 에 넣을 수 있는 키:
   origin(출발역), dest(도착역), date(YYYY-MM-DD, '내일' 등 상대 날짜는 오늘 기준 환산),
   earliest_hour(시간대 시작 0~23 정수), latest_hour(시간대 끝 1~24 정수·그 정각까지 포함, 제한 없으면 ""),
+  max_duration_min(소요시간 상한·분 정수: "2시간 이내"→120, "3시간 넘는 건 빼줘"→180; 60/90/120/150/180/240/300 중 택, 제한 없으면 ""),
   train_no(열차번호 필터, 전체면 ""), passengers(인원 1~9 정수)
 사용자가 조회/검색 실행까지 원하면 "action": "search".
 바꿀 값이 없으면 updates 는 빈 객체."""
